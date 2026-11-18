@@ -17,11 +17,27 @@ export function hasUpload(selector: string): boolean {
   return [...document.querySelectorAll<HTMLInputElement>(selector)].filter(input => !input.disabled && input.parentElement?.getClientRects().length).length === 1;
 }
 
-export function coverPreviewReady(selector: string): boolean {
-  return [...document.querySelectorAll<HTMLInputElement>(selector)].some(input => {
+/**
+ * 抖音接收文件后会清空输入框。以本次上传区的预览变化为准，避免把旧封面当作新图。
+ * 在页内对图片地址做指纹，避免把整张 data URL 传回插件。
+ */
+export function coverPreview({ selector, previous }: { selector: string; previous?: string }): string {
+  for (const input of document.querySelectorAll<HTMLInputElement>(selector)) {
+    if (!input.parentElement?.getClientRects().length) continue;
     const zone = input.closest('.upload-ZOJTUA') ?? input.closest('.semi-upload');
-    return Boolean(input.files?.length && zone?.querySelector('.bg-UvmtRj, img[src^="blob:"], img[src^="data:"], [style*="blob:"], [style*="data:"]'));
-  });
+    for (const preview of zone?.querySelectorAll<HTMLElement>('img, [style*="background"]') ?? []) {
+      if (!preview.getClientRects().length) continue;
+      const source = preview instanceof HTMLImageElement
+        ? (preview.complete && preview.naturalWidth ? preview.currentSrc : '')
+        : preview.style.backgroundImage;
+      if (!source.includes('blob:') && !source.includes('data:image/')) continue;
+      let hash = 0;
+      for (let i = 0; i < source.length; i++) hash = (Math.imul(hash, 31) + source.charCodeAt(i)) | 0;
+      const fingerprint = `${source.length}:${hash}`;
+      return fingerprint === previous ? '' : fingerprint;
+    }
+  }
+  return '';
 }
 
 export function videoStatus(): 'ready' | 'failed' | 'waiting' {
@@ -40,6 +56,11 @@ export function publishReady(): boolean {
 
 export function dialogOpen(): boolean {
   return [...document.querySelectorAll('.dy-creator-content-modal')].some(dialog => dialog.getClientRects().length);
+}
+
+export function coverStepActive(label: string): boolean {
+  return [...document.querySelectorAll('.dy-creator-content-modal :is([class*="step-active"], [role="tab"][aria-selected="true"])')]
+    .some(node => node.getClientRects().length && node.textContent?.trim() === label);
 }
 
 export function clickControl({ selector, exactText }: { selector: string; exactText?: string }): boolean {

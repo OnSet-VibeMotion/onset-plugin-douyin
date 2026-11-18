@@ -38,13 +38,17 @@
       const [reference, input] = root.querySelectorAll('input');
       reference.onchange = () => window.referenceUploads++;
       const finish = root.querySelector('.finish');
+      let selectedCover;
       input.onchange = () => {
-        root.querySelector('.preview').innerHTML = '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" width="20" height="20">';
+        selectedCover = input.files[0];
+        input.value = '';
+        if (!selectedCover) return;
+        root.querySelector('.preview').innerHTML = '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width="20" height="20">';
         finish.disabled = false;
       };
       finish.onclick = () => {
         const apply = () => {
-          window.covers[ratio] = input.files[0].name;
+          window.covers[ratio] = selectedCover.name;
           card.querySelector('button').textContent = '编辑封面';
           root.replaceChildren();
         };

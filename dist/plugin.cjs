@@ -7565,11 +7565,21 @@ function query(selector) {
 function hasUpload(selector) {
   return [...document.querySelectorAll(selector)].filter((input) => !input.disabled && input.parentElement?.getClientRects().length).length === 1;
 }
-function coverPreviewReady(selector) {
-  return [...document.querySelectorAll(selector)].some((input) => {
+function coverPreview({ selector, previous }) {
+  for (const input of document.querySelectorAll(selector)) {
+    if (!input.parentElement?.getClientRects().length) continue;
     const zone = input.closest(".upload-ZOJTUA") ?? input.closest(".semi-upload");
-    return Boolean(input.files?.length && zone?.querySelector('.bg-UvmtRj, img[src^="blob:"], img[src^="data:"], [style*="blob:"], [style*="data:"]'));
-  });
+    for (const preview of zone?.querySelectorAll('img, [style*="background"]') ?? []) {
+      if (!preview.getClientRects().length) continue;
+      const source = preview instanceof HTMLImageElement ? preview.complete && preview.naturalWidth ? preview.currentSrc : "" : preview.style.backgroundImage;
+      if (!source.includes("blob:") && !source.includes("data:image/")) continue;
+      let hash = 0;
+      for (let i = 0; i < source.length; i++) hash = Math.imul(hash, 31) + source.charCodeAt(i) | 0;
+      const fingerprint = `${source.length}:${hash}`;
+      return fingerprint === previous ? "" : fingerprint;
+    }
+  }
+  return "";
 }
 function videoStatus() {
   const status = [...document.querySelectorAll('[class*="long-card"], [class*="progress"], [role="alert"]')].filter((node) => node.getClientRects().length).map((node) => node.innerText).join("\n");
@@ -7582,6 +7592,9 @@ function publishReady() {
 }
 function dialogOpen() {
   return [...document.querySelectorAll(".dy-creator-content-modal")].some((dialog) => dialog.getClientRects().length);
+}
+function coverStepActive(label) {
+  return [...document.querySelectorAll('.dy-creator-content-modal :is([class*="step-active"], [role="tab"][aria-selected="true"])')].some((node) => node.getClientRects().length && node.textContent?.trim() === label);
 }
 function clickControl({ selector, exactText }) {
   const matches = [...document.querySelectorAll(selector)].filter((element2) => element2.getClientRects().length && (!exactText || element2.textContent?.trim() === exactText));
@@ -7920,6 +7933,7 @@ function pickCovers(root, images) {
 }
 
 // src/prepare.ts
+var coverSteps = `${coverDialog} :is([role="tab"], [class^="step-"])`;
 async function preparePage(page, draft, progress, options = {}) {
   const timeout = options.timeout ?? 10 * 6e4;
   progress(0.1, "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u9875\uFF0C\u8BF7\u786E\u8BA4\u5DF2\u767B\u5F55");
@@ -7946,6 +7960,7 @@ async function preparePage(page, draft, progress, options = {}) {
     throw Error("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u6807\u9898\u6216\u7B80\u4ECB\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u7B26\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
   }
   const warnings = draft.tags.filter((tag) => !filled.content.includes("#" + tag)).map((tag) => `\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u8BDD\u9898\u300C${tag}\u300D\u662F\u5426\u5DF2\u52A0\u5165\u3002`);
+  let coverDialogContinued = false;
   for (const [index, ratio] of coverRatios.entries()) {
     const label = ratio === "3:4" ? "3:4 \u7AD6\u5C01\u9762" : "4:3 \u6A2A\u5C01\u9762";
     const file = draft.covers[ratio];
@@ -7955,7 +7970,10 @@ async function preparePage(page, draft, progress, options = {}) {
     }
     progress(0.7 + index * 0.1, `\u6B63\u5728\u8BBE\u7F6E${label}`);
     try {
-      await setCover(page, ratio, file, Math.min(timeout, 2e4));
+      coverDialogContinued = await setCover(page, ratio, file, Math.min(timeout, 2e4), {
+        continued: coverDialogContinued,
+        next: ratio === "3:4" && Boolean(draft.covers["4:3"])
+      });
     } catch (error) {
       warnings.push(`${label}\u9700\u8981\u624B\u52A8\u68C0\u67E5\uFF1A${error instanceof Error ? error.message : "\u5C01\u9762\u64CD\u4F5C\u5931\u8D25"}`);
       if (await page.evaluate(dialogOpen)) {
@@ -7969,17 +7987,25 @@ async function preparePage(page, draft, progress, options = {}) {
   progress(1, "\u89C6\u9891\u548C\u6587\u6848\u5DF2\u51C6\u5907\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u540E\u53D1\u5E03");
   return warnings;
 }
-async function setCover(page, ratio, file, timeout) {
-  const mode = await page.evaluate(openCover, ratio);
-  if (!mode) throw Error("\u627E\u4E0D\u5230\u5BF9\u5E94\u7684\u5C01\u9762\u5165\u53E3");
-  await page.waitFor(dialogOpen, timeout, "\u5C01\u9762\u5F39\u7A97\u672A\u6253\u5F00");
-  const label = ratio === "3:4" ? "\u8BBE\u7F6E\u7AD6\u5C01\u9762" : "\u8BBE\u7F6E\u6A2A\u5C01\u9762";
-  const tabs = `${coverDialog} :is(button, [role="tab"], [class*="title"], [class*="tab"])`;
-  const selected = await page.click(tabs, label);
-  if (!selected && mode === "shared") throw Error("\u627E\u4E0D\u5230\u5BF9\u5E94\u7684\u5C01\u9762\u9009\u9879");
+async function setCover(page, ratio, file, timeout, { continued, next }) {
+  if (!continued) {
+    const mode = await page.evaluate(openCover, ratio);
+    if (!mode) throw Error("\u627E\u4E0D\u5230\u5BF9\u5E94\u7684\u5C01\u9762\u5165\u53E3");
+    await page.waitFor(dialogOpen, timeout, "\u5C01\u9762\u5F39\u7A97\u672A\u6253\u5F00");
+    const label = ratio === "3:4" ? "\u8BBE\u7F6E\u7AD6\u5C01\u9762" : "\u8BBE\u7F6E\u6A2A\u5C01\u9762";
+    const controls = `${coverDialog} :is(button, [class*="title"], [class*="tab"])`;
+    const selected = await page.click(coverSteps, label) || await page.click(controls, label);
+    if (!selected && mode === "shared") throw Error("\u627E\u4E0D\u5230\u5BF9\u5E94\u7684\u5C01\u9762\u9009\u9879");
+  }
   await page.waitFor(hasUpload, timeout, "\u627E\u4E0D\u5230\u552F\u4E00\u7684\u5C01\u9762\u4E0A\u4F20\u63A7\u4EF6", coverInput);
-  await page.upload(coverInput, file);
-  await page.waitFor(coverPreviewReady, timeout, "\u5C01\u9762\u4E0A\u4F20\u540E\u672A\u51FA\u73B0\u9884\u89C8", coverInput);
+  const selector = coverInput;
+  const previous = await page.evaluate(coverPreview, { selector });
+  await page.upload(selector, file);
+  await page.waitFor(coverPreview, timeout, "\u5C01\u9762\u4E0A\u4F20\u540E\u672A\u51FA\u73B0\u65B0\u9884\u89C8", { selector, previous });
+  if (next && await page.click(coverSteps, "\u8BBE\u7F6E\u6A2A\u5C01\u9762")) {
+    await page.waitFor(coverStepActive, timeout, "\u672A\u5207\u6362\u5230\u6A2A\u5C01\u9762", "\u8BBE\u7F6E\u6A2A\u5C01\u9762");
+    return true;
+  }
   const done = `${coverDialog} :is(button, [role="button"])`;
   const deadline = Date.now() + timeout;
   while (!await page.click(done, "\u5B8C\u6210")) {
@@ -7992,6 +8018,7 @@ async function setCover(page, ratio, file, timeout) {
     if (Date.now() >= finishDeadline) throw Error("\u5C01\u9762\u5F39\u7A97\u5C1A\u672A\u5173\u95ED");
     await delay(Math.min(timeout, 250));
   }
+  return false;
 }
 
 // src/app.ts

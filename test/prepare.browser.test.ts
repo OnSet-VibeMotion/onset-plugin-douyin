@@ -66,6 +66,47 @@ it('上传视频、填写标题简介和话题、设置两张封面，发布仍�
     covers: { '3:4': 'portrait.png', '4:3': 'landscape.jpg' }, referenceUploads: 0, submits: 0 });
   await expect(page.click('#publish')).rejects.toThrow('不允许点击发布');
 });
+it('竖横封面共用弹窗时，填完两张再点完成', async () => {
+  const { page } = await pageFor('shared-cover');
+  await page.evaluate(() => {
+    const root = document.querySelector('#modal-root')!;
+    const covers: Record<string, string> = {};
+    const selected: string[] = [];
+    (window as any).selectedCovers = selected;
+    const render = (portrait: boolean) => {
+      const ratio = portrait ? '3:4' : '4:3';
+      root.innerHTML = '<div role="dialog" class="dy-creator-content-modal">'
+        + '<div class="step-test">设置竖封面</div><div class="step-test">设置横封面</div>'
+        + '<div class="upload-ZOJTUA"><input class="semi-upload-hidden-input" type="file"><div class="preview">预览</div></div>'
+        + '<button class="next-cover">设置横封面</button><button class="finish" disabled>完成</button></div>';
+      const [vertical, horizontal] = root.querySelectorAll<HTMLElement>('.step-test');
+      const [current, inactive] = portrait ? [vertical, horizontal] : [horizontal, vertical];
+      current.classList.add('step-active-test');
+      inactive.onclick = () => render(!portrait);
+      const input = root.querySelector<HTMLInputElement>('input')!;
+      const finish = root.querySelector<HTMLButtonElement>('.finish')!;
+      input.onchange = () => {
+        covers[ratio] = input.files![0].name;
+        input.value = '';
+        selected.push(ratio);
+        root.querySelector<HTMLElement>('.preview')!.style.backgroundImage = 'url("data:image/png;base64,cHJldmlldw==")';
+        finish.disabled = false;
+      };
+      finish.onclick = () => {
+        if (!covers['4:3']) {
+          root.insertAdjacentHTML('beforeend', '<div role="dialog"><p>设置横封面获更多流量</p><button>设置横封面</button></div>');
+          return;
+        }
+        (window as any).covers = covers;
+        root.replaceChildren();
+      };
+    };
+    document.querySelector<HTMLButtonElement>('.coverControl-test button')!.onclick = () => render(true);
+  });
+  await expect(preparePage(page, media(), () => {}, { timeout: 2000 })).resolves.toEqual([]);
+  expect(await page.evaluate(() => ({ covers: (window as any).covers, selected: (window as any).selectedCovers, submits: (window as any).submits })))
+    .toEqual({ covers: { '3:4': 'portrait.png', '4:3': 'landscape.jpg' }, selected: ['3:4', '4:3'], submits: 0 });
+});
 it('上传控件消失时停止；离开创作者站点后无法填表或上传', async () => {
   const { page } = await pageFor('outside');
   await page.evaluate(() => document.querySelector('.upload-input')?.remove());

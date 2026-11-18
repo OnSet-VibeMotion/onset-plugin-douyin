@@ -2,6 +2,8 @@ import { Page, delay } from './cdp';
 import { coverRatios, type CoverRatio, type Draft } from './draft';
 import * as scripts from './page-scripts';
 
+const coverSteps = `${scripts.coverDialog} :is([role="tab"], [class^="step-"])`;
+
 export type Progress = (fraction: number, message: string) => void;
 export async function preparePage(page: Page, draft: Draft, progress: Progress, options: { timeout?: number } = {}): Promise<string[]> {
   const timeout = options.timeout ?? 10 * 60_000;
@@ -32,6 +34,7 @@ export async function preparePage(page: Page, draft: Draft, progress: Progress, 
   const warnings = draft.tags.filter(tag => !filled.content.includes('#' + tag))
     .map(tag => `请在抖音页面检查话题「${tag}」是否已加入。`);
 
+  let coverDialogContinued = false;
   for (const [index, ratio] of coverRatios.entries()) {
     const label = ratio === '3:4' ? '3:4 竖封面' : '4:3 横封面';
     const file = draft.covers[ratio];
@@ -41,7 +44,10 @@ export async function preparePage(page: Page, draft: Draft, progress: Progress, 
     }
     progress(0.7 + index * 0.1, `正在设置${label}`);
     try {
-      await setCover(page, ratio, file, Math.min(timeout, 20_000));
+      coverDialogContinued = await setCover(page, ratio, file, Math.min(timeout, 20_000), {
+        continued: coverDialogContinued,
+        next: ratio === '3:4' && Boolean(draft.covers['4:3']),
+      });
     } catch (error) {
       warnings.push(`${label}需要手动检查：${error instanceof Error ? error.message : '封面操作失败'}`);
       if (await page.evaluate(scripts.dialogOpen)) {
@@ -57,17 +63,28 @@ export async function preparePage(page: Page, draft: Draft, progress: Progress, 
   return warnings;
 }
 
-async function setCover(page: Page, ratio: CoverRatio, file: string, timeout: number): Promise<void> {
-  const mode = await page.evaluate(scripts.openCover, ratio);
-  if (!mode) throw Error('找不到对应的封面入口');
-  await page.waitFor(scripts.dialogOpen, timeout, '封面弹窗未打开');
-  const label = ratio === '3:4' ? '设置竖封面' : '设置横封面';
-  const tabs = `${scripts.coverDialog} :is(button, [role="tab"], [class*="title"], [class*="tab"])`;
-  const selected = await page.click(tabs, label);
-  if (!selected && mode === 'shared') throw Error('找不到对应的封面选项');
+async function setCover(
+  page: Page, ratio: CoverRatio, file: string, timeout: number, { continued, next }: { continued: boolean; next: boolean },
+): Promise<boolean> {
+  if (!continued) {
+    const mode = await page.evaluate(scripts.openCover, ratio);
+    if (!mode) throw Error('找不到对应的封面入口');
+    await page.waitFor(scripts.dialogOpen, timeout, '封面弹窗未打开');
+    const label = ratio === '3:4' ? '设置竖封面' : '设置横封面';
+    const controls = `${scripts.coverDialog} :is(button, [class*="title"], [class*="tab"])`;
+    const selected = await page.click(coverSteps, label) || await page.click(controls, label);
+    if (!selected && mode === 'shared') throw Error('找不到对应的封面选项');
+  }
   await page.waitFor(scripts.hasUpload, timeout, '找不到唯一的封面上传控件', scripts.coverInput);
-  await page.upload(scripts.coverInput, file);
-  await page.waitFor(scripts.coverPreviewReady, timeout, '封面上传后未出现预览', scripts.coverInput);
+  const selector = scripts.coverInput;
+  const previous = await page.evaluate(scripts.coverPreview, { selector });
+  await page.upload(selector, file);
+  await page.waitFor(scripts.coverPreview, timeout, '封面上传后未出现新预览', { selector, previous });
+  // 共用弹窗里完成竖封面会弹出横封面推荐。两张都已登记时，先切到横封面，最后一起应用。
+  if (next && await page.click(coverSteps, '设置横封面')) {
+    await page.waitFor(scripts.coverStepActive, timeout, '未切换到横封面', '设置横封面');
+    return true;
+  }
   const done = `${scripts.coverDialog} :is(button, [role="button"])`;
   const deadline = Date.now() + timeout;
   while (!await page.click(done, '完成')) {
@@ -80,4 +97,5 @@ async function setCover(page: Page, ratio: CoverRatio, file: string, timeout: nu
     if (Date.now() >= finishDeadline) throw Error('封面弹窗尚未关闭');
     await delay(Math.min(timeout, 250));
   }
+  return false;
 }
