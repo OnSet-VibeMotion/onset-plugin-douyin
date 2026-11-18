@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>抖音创作者中心</title>
+<header><div class="user-info" data-user-id="dy-test"><span class="nickname">测试创作者</span></div></header>
+<div class="container-upload"><input class="upload-input" type="file" accept="video/*"></div>
+<div id="editor" hidden>
+  <div class="long-card-test"><span id="upload-status">上传中</span></div>
+  <input placeholder="填写作品标题">
+  <div class="zone-container" contenteditable="true" style="min-height: 30px"></div>
+  <div class="coverControl-test">竖封面 3:4 <button type="button">选择封面</button></div>
+  <div class="coverControl-test">横封面 4:3 <button type="button">选择封面</button></div>
+  <button id="publish" disabled>发布</button>
+</div>
+<div id="modal-root"></div>
+<script>
+  window.submits = 0;
+  window.covers = {};
+  window.referenceUploads = 0;
+  document.querySelector('#publish').onclick = () => window.submits++;
+  document.querySelector('.upload-input').onchange = () => {
+    if (!document.querySelector('.upload-input').files.length) return;
+    document.querySelector('#editor').hidden = false;
+    setTimeout(() => {
+      document.querySelector('#upload-status').innerText = '重新上传';
+      document.querySelector('#publish').disabled = false;
+    }, 100);
+  };
+  for (const [index, card] of [...document.querySelectorAll('.coverControl-test')].entries()) {
+    card.querySelector('button').onclick = () => {
+      const ratio = index ? '4:3' : '3:4';
+      const root = document.querySelector('#modal-root');
+      root.innerHTML = `<div role="dialog" class="dy-creator-content-modal">
+        <button type="button">设置${index ? '横' : '竖'}封面</button>
+        <div class="semi-upload">生成参考图 <input type="file" class="semi-upload-hidden-input" accept="image/*"></div>
+        <div class="semi-upload"><span class="semi-upload-drag-area-main-text">点击上传文件或拖拽</span>
+          <input type="file" class="semi-upload-hidden-input" accept="image/*"><div class="preview"></div></div>
+        <button class="finish" disabled>完成</button></div>`;
+      const [reference, input] = root.querySelectorAll('input');
+      reference.onchange = () => window.referenceUploads++;
+      const finish = root.querySelector('.finish');
+      input.onchange = () => {
+        root.querySelector('.preview').innerHTML = '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" width="20" height="20">';
+        finish.disabled = false;
+      };
+      finish.onclick = () => {
+        const apply = () => {
+          window.covers[ratio] = input.files[0].name;
+          card.querySelector('button').textContent = '编辑封面';
+          root.replaceChildren();
+        };
+        if (!index) { apply(); return; }
+        const confirm = document.createElement('div');
+        confirm.setAttribute('role', 'dialog');
+        confirm.innerHTML = '<span>是否确认应用此封面？</span><button>确定</button>';
+        confirm.querySelector('button').onclick = apply;
+        root.append(confirm);
+      };
+    };
+  }
+</script>
