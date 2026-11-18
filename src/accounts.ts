@@ -57,6 +57,20 @@ export class AccountStore {
       return { account, ...(replaced ? { replaced } : {}) };
     } finally { release(); }
   }
+  refreshProfile(id: string, profile: { user_id: string; name: string; avatar: string }): Account {
+    const release = acquireLock(this.root);
+    try {
+      const account = this.get(id);
+      if (account.user_id && account.user_id !== profile.user_id) return account;
+      if (!account.user_id && this.list().some(a => a.id !== id && a.user_id === profile.user_id)) return account;
+      const name = cleanName(profile.name);
+      const avatar = profile.avatar.length <= MaxAvatarChars && avatarPattern.test(profile.avatar) ? profile.avatar : account.avatar;
+      if (name === account.name && avatar === account.avatar && profile.user_id === account.user_id) return account;
+      const updated = { ...account, name, user_id: profile.user_id, ...(avatar ? { avatar } : {}) };
+      atomicJSON(path.join(this.root, id, 'account.json'), updated);
+      return updated;
+    } finally { release(); }
+  }
   remove(id: string): Account {
     const release = acquireLock(this.root);
     try {

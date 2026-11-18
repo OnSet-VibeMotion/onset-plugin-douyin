@@ -56,11 +56,14 @@ it('一键登录：打开登录页，等用户登录好，读出昵称与头像�
   expect(result).toMatchObject({ status: 'logged_in', message: '已登录：抖音创作者' });
   expect(close).toHaveBeenCalledOnce();
   const store = new AccountStore(request.data_dir);
-  expect(store.list().map(a => [a.name, a.user_id, a.avatar])).toEqual([['工作号', 'w1', undefined], ['抖音创作者', 'u9', 'data:image/png;base64,iVBORw0KGgo=']]);
+  expect(Object.fromEntries(store.list().map(a => [a.user_id, [a.name, a.avatar]]))).toEqual({
+    w1: ['工作号', undefined],
+    u9: ['抖音创作者', 'data:image/png;base64,iVBORw0KGgo='],
+  });
 });
 it('同一个账号重新登录：换掉旧的那条', async () => {
   const { request, deps, evaluate } = setup();
-  evaluate.mockResolvedValueOnce({ name: '工作号改名', avatar: '', user_id: 'w1' });
+  evaluate.mockResolvedValue({ name: '工作号改名', avatar: '', user_id: 'w1' });
   expect((await runOperation('login', request, () => {}, deps)).message).toBe('「工作号改名」重新登录好了');
   expect(new AccountStore(request.data_dir).list().map(a => a.name)).toEqual(['工作号改名']);
   expect(deps.avatar).not.toHaveBeenCalled();
@@ -110,7 +113,8 @@ it('先校验素材，再开浏览器，错误时不会上传', async () => {
   expect(deps.open).not.toHaveBeenCalled();
 });
 it('没打开项目时账号操作不写任何项目；上传仍要项目', async () => {
-  const { request, deps, account } = setup();
+  const { request, deps, account, state } = setup();
+  state.mockResolvedValue({ open: true, visible: false });
   const project = request.project_root;
   request.project_root = '';
   request.params = { account: account.id };
@@ -120,7 +124,8 @@ it('没打开项目时账号操作不写任何项目；上传仍要项目', asyn
   expect(deps.draft).not.toHaveBeenCalled();
 });
 it('打开指定账号，只打开页面，不读取项目视频', async () => {
-  const { request, account, deps } = setup(); request.params = { account: account.id };
+  const { request, account, deps, state } = setup(); request.params = { account: account.id };
+  state.mockResolvedValue({ open: true, visible: false });
   await runOperation('open_account', request, () => {}, deps);
   expect(deps.draft).not.toHaveBeenCalled(); expect(deps.prepare).not.toHaveBeenCalled();
 });
@@ -149,11 +154,77 @@ it('旧客户端缺内嵌页面连接时明确报错，不启动外部浏览器'
   await expect(runOperation('open_account', { ...request, browser: undefined })).rejects.toThrow(/更新片场/);
 });
 
-it('登录后拿不到昵称时仍保留独立账号，并在取消时清理临时会话', async () => {
-  const { request, deps, evaluate, state, forget } = setup();
-  evaluate.mockResolvedValueOnce({ name: '', avatar: '', user_id: '' });
-  expect((await runOperation('login', request, () => {}, deps)).account?.name).toMatch(/^抖音账号 [a-f0-9]{6}$/);
-  state.mockResolvedValueOnce({ open: false, visible: false });
-  await expect(runOperation('login', request, () => {}, deps)).rejects.toThrow('页面关掉');
+it('登录成功后等待资料加载，再保存昵称和头像', async () => {
+  const { request, deps, evaluate } = setup();
+  evaluate.mockResolvedValueOnce({ name: '', avatar: '', user_id: 'u9' })
+    .mockResolvedValueOnce({ name: '抖音创作者', avatar: '', user_id: 'u9' })
+    .mockResolvedValueOnce({ name: '', avatar: 'https://p3.douyinstatic.com/avatar.png', user_id: 'u9' });
+  expect((await runOperation('login', request, () => {}, deps)).account).toMatchObject({
+    name: '抖音创作者', user_id: 'u9', avatar: 'data:image/png;base64,iVBORw0KGgo=',
+  });
+  expect(evaluate).toHaveBeenCalledTimes(3);
+});
+it('已登录但始终没有昵称，不保存占位账号并清理临时会话', async () => {
+  const { request, deps, evaluate, forget } = setup();
+  evaluate.mockResolvedValue({ name: '', avatar: '', user_id: 'u9' });
+  await expect(runOperation('login', request, () => {}, deps)).rejects.toThrow('昵称');
+  expect(new AccountStore(request.data_dir).list().map(a => a.name)).toEqual(['工作号']);
   expect(forget).toHaveBeenCalledOnce();
+});
+it('打开旧账号时刷新昵称和头像，沿用现有会话编号', async () => {
+  const { request, account, deps, evaluate } = setup();
+  request.params = { account: account.id };
+  evaluate.mockResolvedValue({ name: '工作号新昵称', avatar: 'https://p3.douyinpic.com/a.jpg', user_id: 'w1' });
+  const result = await runOperation('open_account', request, () => {}, deps);
+  const expected = { ...account, name: '工作号新昵称', avatar: 'data:image/png;base64,iVBORw0KGgo=' };
+  expect(result.account).toEqual(expected);
+  expect(new AccountStore(request.data_dir).get(account.id)).toEqual(expected);
+});
+it('在打开的原账号窗口里重新登录后，自动更新同一个账号', async () => {
+  const { request, account, deps, evaluate, close, forget, navigate } = setup();
+  request.params = { account: account.id };
+  evaluate.mockResolvedValueOnce(null).mockRejectedValueOnce(Error('页面正在跳转')).mockResolvedValueOnce(null)
+    .mockResolvedValue({ name: '重新登录的工作号', avatar: 'https://p3.douyinpic.com/a.jpg', user_id: 'w1' });
+  const result = await runOperation('open_account', request, () => {}, deps);
+  expect(result).toMatchObject({ status: 'login_refreshed', account: { ...account, name: '重新登录的工作号' } });
+  expect(new AccountStore(request.data_dir).list()).toEqual([result.account]);
+  expect(deps.open).toHaveBeenCalledExactlyOnceWith(expect.any(String), expect.objectContaining({ account: account.id }));
+  expect(close).not.toHaveBeenCalled();
+  expect(forget).not.toHaveBeenCalled();
+  expect(navigate).not.toHaveBeenCalled();
+});
+it('收起账号窗口时结束登录检查并保留原账号和浏览器会话', async () => {
+  const { request, account, deps, state, close, forget } = setup();
+  request.params = { account: account.id };
+  state.mockResolvedValueOnce({ open: true, visible: true }).mockResolvedValue({ open: true, visible: false });
+  expect(await runOperation('open_account', request, () => {}, deps)).toMatchObject({ status: 'login_pending', account });
+  expect(new AccountStore(request.data_dir).get(account.id)).toEqual(account);
+  expect(close).not.toHaveBeenCalled();
+  expect(forget).not.toHaveBeenCalled();
+});
+it('打开旧账号看到其他用户时，保留原来的账号资料', async () => {
+  const { request, account, deps, evaluate } = setup();
+  request.params = { account: account.id };
+  evaluate.mockResolvedValue({ name: '其他用户', avatar: 'https://p3.douyinpic.com/a.jpg', user_id: 'other' });
+  await expect(runOperation('open_account', request, () => {}, deps)).rejects.toThrow('当前登录的抖音账号与「工作号」不同');
+  expect(new AccountStore(request.data_dir).get(account.id)).toEqual(account);
+  expect(deps.avatar).not.toHaveBeenCalled();
+});
+it('旧账号缺少 UID，头像暂未载入时仍记录已确认的昵称与 UID', async () => {
+  const { request, deps, evaluate } = setup();
+  const store = new AccountStore(request.data_dir);
+  const account = store.saveLoggedIn({ id: newAccountID(), name: '旧账号' }).account;
+  request.params = { account: account.id };
+  evaluate.mockResolvedValueOnce({ name: '已确认的昵称', avatar: '', user_id: 'u9' });
+  await runOperation('open_account', request, () => {}, deps);
+  expect(store.get(account.id)).toEqual({ ...account, name: '已确认的昵称', user_id: 'u9' });
+  expect(deps.avatar).not.toHaveBeenCalled();
+});
+it('打开账号时只有 UID，应提示资料还未刷新', async () => {
+  const { request, account, deps, evaluate } = setup();
+  request.params = { account: account.id };
+  evaluate.mockResolvedValue({ name: '', avatar: '', user_id: account.user_id });
+  expect(await runOperation('open_account', request, () => {}, deps)).toMatchObject({
+    status: 'profile_pending', account,
+  });
 });

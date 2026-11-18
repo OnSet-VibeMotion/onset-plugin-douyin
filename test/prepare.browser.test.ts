@@ -73,12 +73,74 @@ it('上传控件消失时停止；离开创作者站点后无法填表或上传'
   await page.raw('Page.navigate', { url: 'about:blank' });
   await expect(page.upload('.upload-input', media().video)).rejects.toThrow();
 });
-it('已登录时从创作者页面取账号，登录提示出现时继续等待', async () => {
+it('仅显示上传框和页头账号时，不把页面占位数据当成登录资料', async () => {
   const { page } = await pageFor('login');
-  expect(await page.evaluate(scripts.loginInfo, scripts.videoInput)).toEqual({ name: '测试创作者', avatar: '', user_id: 'dy-test' });
-  await page.evaluate(() => { document.body.insertAdjacentHTML('afterbegin', '<button>扫码登录</button>'); });
-  expect(await page.evaluate(scripts.loginInfo, scripts.videoInput)).toBeNull();
+  expect(await page.evaluate(scripts.loginInfo)).toBeNull();
 });
+it('快速接口只有 UID、详情省略 UID 时，从媒体接口取同一个账号的完整资料', async () => {
+  const { page } = await pageFor('login-profile');
+  await page.evaluate(() => {
+    window.fetch = async (input, options) => {
+      if (options?.credentials !== 'same-origin') throw Error('请求缺少同源会话');
+      if (input === '/aweme/v1/creator/pc/user/info/') return new Response('{"status_code":0,"uid":12345678901234567890}');
+      if (input === '/aweme/v1/creator/user/info/') {
+        return Response.json({ status_code: 0, user_profile: { nick_name: '页面详情', avatar_url: '//p11.douyinpic.com/avatar.webp' } });
+      }
+      if (input === '/web/api/media/user/info/?device_platform=web') {
+        return Response.json({
+          status_code: 0,
+          user: { uid: '12345678901234567890', nickname: '已登录创作者', avatar_thumb: { url_list: ['//p3.douyinpic.com/avatar.webp'] } },
+        });
+      }
+      throw Error('未知请求');
+    };
+  });
+  expect(await page.evaluate(scripts.loginInfo)).toEqual({
+    name: '已登录创作者', avatar: 'https://p3.douyinpic.com/avatar.webp', user_id: '12345678901234567890',
+  });
+});
+it('媒体接口账号不同时，等待当前账号的资料', async () => {
+  const { page } = await pageFor('login-switch');
+  await page.evaluate(() => {
+    window.fetch = async input => {
+      if (input === '/aweme/v1/creator/pc/user/info/') return Response.json({ status_code: 0, uid: '123' });
+      if (input === '/web/api/media/user/info/?device_platform=web') return Response.json({
+        status_code: 0,
+        user: { uid: '456', nickname: '另一个账号', avatar_thumb: { url_list: ['https://p3.douyinpic.com/other.jpg'] } },
+      });
+      return Response.json({ status_code: 0, user_profile: { nick_name: '无法确认归属' } });
+    };
+  });
+  expect(await page.evaluate(scripts.loginInfo)).toEqual({ name: '', avatar: '', user_id: '123' });
+});
+
+it('创作者中心已确认登录时，不依赖上传框或头像节点', async () => {
+  const { page } = await pageFor('login-api');
+  await page.evaluate(() => {
+    document.querySelector('.upload-input')?.remove();
+    document.querySelector('header')?.remove();
+    document.body.insertAdjacentHTML('afterbegin', '<button>扫码登录</button>');
+    window.fetch = async (input, options) => {
+      if (input !== '/aweme/v1/creator/pc/user/info/' || options?.credentials !== 'same-origin') throw Error('请求不符合约定');
+      return Response.json({
+        status_code: 0, uid: '12345678901234567890',
+        user_profile: { nick_name: '已登录创作者', avatar_url: 'https://example.test/avatar.png' },
+      });
+    };
+  });
+  expect(await page.evaluate(scripts.loginInfo)).toEqual({
+    name: '已登录创作者', avatar: 'https://example.test/avatar.png', user_id: '12345678901234567890',
+  });
+});
+
+it('接口显示未登录时，不把残留的上传框当作登录成功', async () => {
+  const { page } = await pageFor('login-required');
+  await page.evaluate(() => {
+    window.fetch = async () => Response.json({ status_code: 8, uid: '123' });
+  });
+  expect(await page.evaluate(scripts.loginInfo)).toBeNull();
+});
+
 it('抖音上传页更新导致封面入口缺失时，保留已填表单并提示用户检查', async () => {
   const { page } = await pageFor('missing-cover');
   await page.evaluate(() => document.querySelectorAll('.coverControl-test').forEach(e => e.remove()));

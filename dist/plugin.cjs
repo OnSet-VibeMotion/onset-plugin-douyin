@@ -7478,6 +7478,22 @@ var AccountStore = class {
       release();
     }
   }
+  refreshProfile(id, profile) {
+    const release = acquireLock(this.root);
+    try {
+      const account = this.get(id);
+      if (account.user_id && account.user_id !== profile.user_id) return account;
+      if (!account.user_id && this.list().some((a) => a.id !== id && a.user_id === profile.user_id)) return account;
+      const name = cleanName(profile.name);
+      const avatar = profile.avatar.length <= MaxAvatarChars && avatarPattern.test(profile.avatar) ? profile.avatar : account.avatar;
+      if (name === account.name && avatar === account.avatar && profile.user_id === account.user_id) return account;
+      const updated = { ...account, name, user_id: profile.user_id, ...avatar ? { avatar } : {} };
+      atomicJSON(import_node_path2.default.join(this.root, id, "account.json"), updated);
+      return updated;
+    } finally {
+      release();
+    }
+  }
   remove(id) {
     const release = acquireLock(this.root);
     try {
@@ -7631,17 +7647,43 @@ function filledContent() {
   const content = [...document.querySelectorAll('.zone-container[contenteditable="true"], [contenteditable="true"][data-placeholder*="\u7B80\u4ECB"], [contenteditable="true"][aria-label*="\u7B80\u4ECB"]')].find((node) => node.getClientRects().length)?.innerText ?? "";
   return { title, content };
 }
-function loginInfo(uploadSelector) {
-  const hasLogin = [...document.querySelectorAll('button, a, [role="button"], span')].some((node) => node.getClientRects().length && /^(扫码登录|手机号登录|验证码登录|登录\/注册|立即登录|登录抖音)$/.test(node.innerText.trim()));
-  if (hasLogin || /(?:login|passport)/i.test(location.pathname)) return null;
-  const profiles = [...document.querySelectorAll('header [class*="user" i], header [class*="account" i], [class*="header" i] [class*="user" i]')];
-  const profile = profiles.find((node) => node.getClientRects().length && node.querySelector('[class*="nick" i], [class*="name" i], img'));
-  const name = profile?.querySelector('[class*="nick" i], [class*="name" i]')?.textContent?.trim() ?? "";
-  const avatar = profile?.querySelector("img")?.src ?? "";
-  const shortID = profile?.querySelector('[class*="short-id"]')?.textContent?.replace(/^抖音号[：:]\s*/, "").trim();
-  const userId = profile?.getAttribute("data-user-id") ?? shortID ?? "";
-  const uploadPage = location.pathname.startsWith("/creator-micro/content/") && [...document.querySelectorAll(uploadSelector)].some((node) => node.parentElement?.getClientRects().length);
-  return uploadPage || name && avatar && userId ? { name, avatar, user_id: userId } : null;
+async function loginInfo() {
+  if (/(?:login|passport)/i.test(location.pathname)) return null;
+  async function read(source) {
+    const endpoint = source === "fast" ? "/aweme/v1/creator/pc/user/info/" : "/web/api/media/user/info/?device_platform=web";
+    try {
+      const response = await fetch(endpoint, {
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+        signal: AbortSignal.timeout(4e3)
+      });
+      if (!response.ok) return null;
+      const data = JSON.parse(await response.text(), (key, value, context) => {
+        if (key === "uid" && typeof value === "number") {
+          return context?.source ?? (Number.isSafeInteger(value) ? String(value) : "");
+        }
+        return value;
+      });
+      if (data?.status_code !== 0) return null;
+      const media2 = source === "media" ? data.user : void 0;
+      const rawUID = source === "media" ? media2?.uid : data.uid;
+      const uid = typeof rawUID === "string" ? rawUID.trim() : "";
+      if (!/^[1-9][0-9]{0,79}$/.test(uid)) return null;
+      const nickname = media2 ? media2.nickname : data.user_profile?.nick_name;
+      const thumbs = media2?.avatar_thumb?.url_list;
+      const avatarURL = media2 ? Array.isArray(thumbs) ? thumbs.find((url) => typeof url === "string" && /^(https:)?\/\//i.test(url.trim())) : void 0 : data.user_profile?.avatar_url;
+      const avatar = typeof avatarURL === "string" ? avatarURL.trim() : "";
+      return { name: typeof nickname === "string" ? nickname.trim() : "", avatar: avatar.startsWith("//") ? "https:" + avatar : avatar, user_id: uid };
+    } catch {
+      return null;
+    }
+  }
+  const fast = await read("fast");
+  if (fast?.name && fast.avatar) return fast;
+  const media = await read("media");
+  if (!fast || !media || fast.user_id !== media.user_id) return fast ?? media;
+  return { name: fast.name || media.name, avatar: fast.avatar || media.avatar, user_id: fast.user_id };
 }
 
 // src/cdp.ts
@@ -7956,7 +7998,7 @@ async function setCover(page, ratio, file, timeout) {
 var operations = ["accounts", "login", "open_account", "remove_account", "prepare"];
 async function fetchAvatar(raw) {
   const url = new URL(raw);
-  if (url.protocol !== "https:" || !/(^|\.)(douyinpic\.com|douyin\.com|byteimg\.com)$/.test(url.hostname)) return "";
+  if (url.protocol !== "https:" || !/(^|\.)(douyinpic\.com|douyin\.com|douyinstatic\.com|byteimg\.com)$/.test(url.hostname)) return "";
   const response = await fetch(url, { signal: AbortSignal.timeout(1e4), redirect: "error" });
   const type = (response.headers.get("content-type") ?? "").split(";")[0].trim();
   if (!response.ok || !/^image\/(png|jpeg|gif|webp)$/.test(type)) return "";
@@ -8036,7 +8078,8 @@ async function runOperation(operation, raw, progress = () => {
       const accounts = store.list();
       return { status: "accounts_loaded", message: accounts.length ? `${accounts.length} \u4E2A\u8D26\u53F7` : "\u8FD8\u6CA1\u6709\u8D26\u53F7", items: accountItems(accounts), accounts: pageAccounts(accounts) };
     }
-    update({ status: "running", message: operation === "login" ? "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u767B\u5F55\u9875\u2026" : "\u6B63\u5728\u51C6\u5907\u2026" });
+    const opening = operation === "login" || operation === "open_account";
+    update({ status: "running", message: opening ? "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u7A97\u53E3\u2026" : "\u6B63\u5728\u51C6\u5907\u2026" });
     if (operation === "login") {
       const result2 = await login(request2, store, progress, deps);
       update(result2);
@@ -8056,11 +8099,18 @@ async function runOperation(operation, raw, progress = () => {
     const result = await withAccountLock(store.profile(account.id), async () => {
       const draft = operation === "prepare" ? await deps.draft(root) : null;
       progress(0.05, `\u6B63\u5728\u6253\u5F00\u300C${account.name}\u300D\u7684\u6296\u97F3\u7A97\u53E3`);
-      const browser = await deps.open(store.profile(account.id), { bridge: request2.browser, account: account.id, label: account.name, hint: draft ? "\u8BF7\u68C0\u67E5\u8D26\u53F7\u4E0E\u5185\u5BB9\uFF0C\u53D1\u5E03\u7531\u4F60\u786E\u8BA4" : "\u8FD9\u662F\u8FD9\u4E2A\u8D26\u53F7\u7684\u6296\u97F3\u7A97\u53E3" });
+      const browser = await deps.open(store.profile(account.id), { bridge: request2.browser, account: account.id, label: account.name, hint: draft ? "\u8BF7\u68C0\u67E5\u8D26\u53F7\u4E0E\u5185\u5BB9\uFF0C\u53D1\u5E03\u7531\u4F60\u786E\u8BA4" : "\u5982\u9700\u91CD\u65B0\u767B\u5F55\uFF0C\u8BF7\u5728\u8FD9\u91CC\u767B\u5F55\u539F\u6296\u97F3\u8D26\u53F7\uFF0C\u7247\u573A\u4F1A\u81EA\u52A8\u66F4\u65B0\u8D26\u53F7\u8D44\u6599" });
       try {
         const page = await deps.page(browser);
         if (draft && browser.reused) await page.navigate(page.origin + UploadPath);
-        if (!draft) return { status: "browser_opened", message: `\u5DF2\u6253\u5F00\u300C${account.name}\u300D\u7684\u6296\u97F3\u7A97\u53E3`, account };
+        if (!draft) {
+          const result2 = await refreshOpenAccount(browser, page, store, account, deps, (message) => {
+            progress(0.1, message);
+            update({ status: "running", message, account });
+          });
+          account = result2.account;
+          return result2;
+        }
         const warnings = await deps.prepare(page, draft, (fraction, message) => {
           progress(fraction, message);
           update({ status: "running", message, account });
@@ -8089,22 +8139,29 @@ async function login(request2, store, progress, deps) {
     progress(0.1, "\u7B49\u4F60\u5728\u6296\u97F3\u9875\u9762\u767B\u5F55\u2026");
     const deadline = Date.now() + deps.loginTimeout;
     let info = null;
+    let profilePolls = 0;
+    let avatar = "";
     for (; ; ) {
       if (Date.now() > deadline) throw Error("\u7B49\u4E86\u5341\u5206\u949F\u8FD8\u6CA1\u767B\u5F55\uFF0C\u8FD9\u6B21\u6CA1\u6709\u6DFB\u52A0\u8D26\u53F7");
       const state = await browser.state?.();
       if (state && (!state.open || !state.visible)) throw Error("\u767B\u5F55\u9875\u9762\u5173\u6389\u4E86\uFF0C\u8FD9\u6B21\u6CA1\u6709\u6DFB\u52A0\u8D26\u53F7");
-      try {
-        info = await page.evaluate(loginInfo, videoInput);
-      } catch {
-        info = null;
+      const current = await readProfile(page);
+      if (current && current.user_id === info?.user_id) {
+        info = { ...current, name: current.name || info.name, avatar: current.avatar || info.avatar };
+        profilePolls++;
+      } else {
+        info = current;
+        profilePolls = current ? 1 : 0;
       }
-      if (info) break;
-      await deps.sleep(1500);
+      if (info?.name && info.avatar && (avatar = await loadAvatar(info.avatar, deps))) break;
+      if (info && profilePolls >= 4) {
+        if (!info.name) throw Error("\u5DF2\u767B\u5F55\u6296\u97F3\uFF0C\u4F46\u8BFB\u53D6\u4E0D\u5230\u6635\u79F0\u3002\u8BF7\u5728\u6296\u97F3\u521B\u4F5C\u8005\u4E2D\u5FC3\u786E\u8BA4\u8D26\u53F7\u540E\u91CD\u8BD5");
+        break;
+      }
+      await deps.sleep(3e3);
     }
-    const name = info.name || `\u6296\u97F3\u8D26\u53F7 ${id.slice(0, 6)}`;
-    progress(0.9, `\u5DF2\u767B\u5F55\u300C${name}\u300D\uFF0C\u6B63\u5728\u4FDD\u5B58\u8D26\u53F7`);
-    const avatar = info.avatar ? await deps.avatar(info.avatar).catch(() => "") : "";
-    const { account, replaced } = store.saveLoggedIn({ id, name, user_id: info.user_id, avatar });
+    progress(0.9, `\u5DF2\u767B\u5F55\u300C${info.name}\u300D\uFF0C\u6B63\u5728\u4FDD\u5B58\u8D26\u53F7`);
+    const { account, replaced } = store.saveLoggedIn({ id, name: info.name, user_id: info.user_id, avatar });
     saved = true;
     await browser.close?.().catch(() => {
     });
@@ -8121,6 +8178,42 @@ async function login(request2, store, progress, deps) {
       store.removeFiles(id);
     }
   }
+}
+async function readProfile(page) {
+  return page.evaluate(loginInfo).catch(() => null);
+}
+async function loadAvatar(url, deps) {
+  return url ? deps.avatar(url).catch(() => "") : "";
+}
+async function refreshOpenAccount(browser, page, store, account, deps, waiting) {
+  const deadline = Date.now() + deps.loginTimeout;
+  let info = await readProfile(page);
+  if (!info) waiting(`\u5982\u9700\u91CD\u65B0\u767B\u5F55\uFF0C\u8BF7\u5728\u6296\u97F3\u7A97\u53E3\u767B\u5F55\u300C${account.name}\u300D\uFF0C\u7247\u573A\u4F1A\u81EA\u52A8\u66F4\u65B0\u8D26\u53F7\u8D44\u6599`);
+  while (!info && browser.state && Date.now() < deadline) {
+    const state = await browser.state();
+    if (!state.open) break;
+    if (state.visible) await deps.sleep(3e3);
+    info = await readProfile(page);
+    if (!state.visible) break;
+  }
+  if (!info) return { status: "login_pending", message: `\u6682\u672A\u786E\u8BA4\u300C${account.name}\u300D\u7684\u767B\u5F55\u72B6\u6001\uFF0C\u53EF\u4EE5\u518D\u6B21\u6253\u5F00\u6296\u97F3\u68C0\u67E5`, account };
+  const checkAccount = (profile) => {
+    if (account.user_id && profile.user_id !== account.user_id) throw Error(`\u5F53\u524D\u767B\u5F55\u7684\u6296\u97F3\u8D26\u53F7\u4E0E\u300C${account.name}\u300D\u4E0D\u540C\uFF0C\u8BF7\u5728\u8FD9\u4E2A\u7A97\u53E3\u767B\u5F55\u539F\u8D26\u53F7\u540E\u91CD\u65B0\u6253\u5F00\u68C0\u67E5`);
+  };
+  checkAccount(info);
+  if (!info.name || !info.avatar) {
+    await deps.sleep(1e3);
+    const next = await readProfile(page);
+    if (next) {
+      checkAccount(next);
+      if (next.user_id !== info.user_id) throw Error("\u6296\u97F3\u767B\u5F55\u8D26\u53F7\u53D1\u751F\u4E86\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u68C0\u67E5");
+      info = { ...next, name: next.name || info.name, avatar: next.avatar || info.avatar };
+    }
+  }
+  const updated = info.name || account.user_id ? store.refreshProfile(account.id, { ...info, name: info.name || account.name, avatar: await loadAvatar(info.avatar, deps) }) : account;
+  if (!info.name) return { status: "profile_pending", message: "\u6296\u97F3\u5DF2\u767B\u5F55\uFF0C\u6682\u672A\u8BFB\u5230\u6635\u79F0\uFF0C\u8D26\u53F7\u8D44\u6599\u672A\u5B8C\u6574\u66F4\u65B0", account: updated };
+  const message = updated.avatar ? `\u5DF2\u5237\u65B0\u300C${updated.name}\u300D\u7684\u8D26\u53F7\u8D44\u6599` : `\u5DF2\u5237\u65B0\u300C${updated.name}\u300D\u7684\u6635\u79F0\uFF0C\u6682\u672A\u83B7\u53D6\u5934\u50CF`;
+  return { status: "login_refreshed", message, account: updated };
 }
 async function forgetSession(request2, id, deps) {
   const bridge = deps.bridge(request2.browser);

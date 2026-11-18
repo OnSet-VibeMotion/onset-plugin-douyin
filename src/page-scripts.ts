@@ -119,17 +119,49 @@ export function filledContent(): { title: string; content: string } {
   return { title, content };
 }
 
-export function loginInfo(uploadSelector: string): { name: string; avatar: string; user_id: string } | null {
-  const hasLogin = [...document.querySelectorAll<HTMLElement>('button, a, [role="button"], span')]
-    .some(node => node.getClientRects().length && /^(扫码登录|手机号登录|验证码登录|登录\/注册|立即登录|登录抖音)$/.test(node.innerText.trim()));
-  if (hasLogin || /(?:login|passport)/i.test(location.pathname)) return null;
-  const profiles = [...document.querySelectorAll<HTMLElement>('header [class*="user" i], header [class*="account" i], [class*="header" i] [class*="user" i]')];
-  const profile = profiles.find(node => node.getClientRects().length && node.querySelector('[class*="nick" i], [class*="name" i], img'));
-  const name = profile?.querySelector('[class*="nick" i], [class*="name" i]')?.textContent?.trim() ?? '';
-  const avatar = profile?.querySelector('img')?.src ?? '';
-  const shortID = profile?.querySelector('[class*="short-id"]')?.textContent?.replace(/^抖音号[：:]\s*/, '').trim();
-  const userId = profile?.getAttribute('data-user-id') ?? shortID ?? '';
-  const uploadPage = location.pathname.startsWith('/creator-micro/content/')
-    && [...document.querySelectorAll(uploadSelector)].some(node => node.parentElement?.getClientRects().length);
-  return uploadPage || (name && avatar && userId) ? { name, avatar, user_id: userId } : null;
+export interface LoginInfo { name: string; avatar: string; user_id: string }
+
+export async function loginInfo(): Promise<LoginInfo | null> {
+  if (/(?:login|passport)/i.test(location.pathname)) return null;
+
+  async function read(source: 'fast' | 'media'): Promise<LoginInfo | null> {
+    const endpoint = source === 'fast' ? '/aweme/v1/creator/pc/user/info/' : '/web/api/media/user/info/?device_platform=web';
+    try {
+      const response = await fetch(endpoint, {
+        credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(4000),
+      });
+      if (!response.ok) return null;
+      // UID 可能以 JSON 数字返回。取原始字符，避免超过安全整数时丢失精度。
+      const data = JSON.parse(await response.text(), (key, value: unknown, context?: { source: string }) => {
+        if (key === 'uid' && typeof value === 'number') {
+          return context?.source ?? (Number.isSafeInteger(value) ? String(value) : '');
+        }
+        return value;
+      }) as {
+        status_code?: unknown;
+        uid?: unknown;
+        user_profile?: { nick_name?: unknown; avatar_url?: unknown };
+        user?: { uid?: unknown; nickname?: unknown; avatar_thumb?: { url_list?: unknown } };
+      } | null;
+      if (data?.status_code !== 0) return null;
+      const media = source === 'media' ? data.user : undefined;
+      const rawUID = source === 'media' ? media?.uid : data.uid;
+      const uid = typeof rawUID === 'string' ? rawUID.trim() : '';
+      if (!/^[1-9][0-9]{0,79}$/.test(uid)) return null;
+      const nickname = media ? media.nickname : data.user_profile?.nick_name;
+      const thumbs = media?.avatar_thumb?.url_list;
+      const avatarURL = media
+        ? (Array.isArray(thumbs) ? thumbs.find(url => typeof url === 'string' && /^(https:)?\/\//i.test(url.trim())) : undefined)
+        : data.user_profile?.avatar_url;
+      const avatar = typeof avatarURL === 'string' ? avatarURL.trim() : '';
+      return { name: typeof nickname === 'string' ? nickname.trim() : '', avatar: avatar.startsWith('//') ? 'https:' + avatar : avatar, user_id: uid };
+    } catch { return null; }
+  }
+
+  // 详细资料接口可能不返回 UID。创作者中心的媒体接口把昵称、头像与 UID 放在同一个 user 里。
+  const fast = await read('fast');
+  if (fast?.name && fast.avatar) return fast;
+  const media = await read('media');
+  if (!fast || !media || fast.user_id !== media.user_id) return fast ?? media;
+  return { name: fast.name || media.name, avatar: fast.avatar || media.avatar, user_id: fast.user_id };
 }
