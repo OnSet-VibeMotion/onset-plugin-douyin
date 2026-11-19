@@ -1,11 +1,11 @@
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { openBrowser, findBrowser } from './support/browser';
 import { CDP, Page } from '../src/cdp';
-import { preparePage } from '../src/prepare';
+import { canResume, preparePage } from '../src/prepare';
 import * as scripts from '../src/page-scripts';
 
 let root: string, origin: string, server: http.Server;
@@ -201,4 +201,162 @@ it('检测到上传失败后不填写，也不尝试提交', async () => {
   });
   await expect(preparePage(page, media(), () => {}, { timeout: 500 })).rejects.toThrow('上传或处理失败');
   expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('');
+});
+
+it('大视频上传超过单步时限也一直等，进度在走就传完接着填写', async () => {
+  const { page } = await pageFor('slow-upload');
+  await page.evaluate(() => {
+    const video = document.querySelector<HTMLInputElement>('.upload-input')!;
+    video.onchange = () => {
+      document.querySelector<HTMLElement>('#editor')!.hidden = false;
+      let percent = 0;
+      const status = document.querySelector<HTMLElement>('#upload-status')!;
+      status.innerText = '上传中 0%';
+      const timer = setInterval(() => {
+        percent += 10;
+        if (percent < 100) { status.innerText = `上传中 ${percent}%`; return; }
+        clearInterval(timer);
+        status.innerText = '重新上传';
+        document.querySelector<HTMLButtonElement>('#publish')!.disabled = false;
+      }, 150);
+    };
+  });
+  const messages: string[] = [];
+  const uploads: number[] = [];
+  const started = Date.now();
+  await expect(preparePage(page, media(), (_f, message) => messages.push(message),
+    { timeout: 600, onUpload: () => uploads.push(Date.now()) })).resolves.toEqual([]);
+  expect(Date.now() - started).toBeGreaterThan(1000);
+  expect(uploads).toHaveLength(1);
+  expect(messages).toEqual(expect.arrayContaining([expect.stringMatching(/^正在上传视频 \d+%/), '正在填写标题、简介和话题']));
+  expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('我的标题');
+});
+
+it('窗口开着时上传卡住也不设时限，等抖音传完照样接着填写', async () => {
+  const { page } = await pageFor('stalled-upload');
+  await page.evaluate(() => {
+    document.querySelector<HTMLInputElement>('.upload-input')!.onchange = () => {
+      document.querySelector<HTMLElement>('#editor')!.hidden = false;
+      document.querySelector('#upload-status')!.textContent = '上传中 40%';
+      setTimeout(() => {
+        document.querySelector('#upload-status')!.textContent = '重新上传';
+        document.querySelector<HTMLButtonElement>('#publish')!.disabled = false;
+      }, 2500);
+    };
+  });
+  await expect(preparePage(page, media(), () => {}, { timeout: 500 })).resolves.toEqual([]);
+  expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('我的标题');
+});
+
+it('窗口关掉时停止等待', async () => {
+  const { page } = await pageFor('closed-window');
+  await page.evaluate(() => {
+    document.querySelector<HTMLInputElement>('.upload-input')!.onchange = () => {
+      document.querySelector<HTMLElement>('#editor')!.hidden = false;
+      document.querySelector('#upload-status')!.textContent = '上传中 40%';
+      setTimeout(() => { location.href = 'about:blank'; }, 300);
+    };
+  });
+  await expect(preparePage(page, media(), () => {}, { timeout: 500 })).rejects.toThrow();
+});
+
+it('窗口停在编辑页时接着上次的上传填写，不再上传一次视频', async () => {
+  const { page } = await pageFor('resume');
+  expect(await canResume(page)).toBe(false);
+  // 上次的操作在等上传时中断了：编辑页开着，视频还在传。
+  await page.evaluate(() => {
+    (window as any).videoUploads = 0;
+    document.querySelector<HTMLInputElement>('.upload-input')!.onchange = () => { (window as any).videoUploads++; };
+    document.querySelector<HTMLElement>('#editor')!.hidden = false;
+    document.querySelector('#upload-status')!.textContent = '上传中 40%';
+  });
+  expect(await canResume(page)).toBe(true);
+  await page.evaluate(() => setTimeout(() => {
+    document.querySelector('#upload-status')!.textContent = '重新上传';
+    document.querySelector<HTMLButtonElement>('#publish')!.disabled = false;
+  }, 500));
+  const uploaded = vi.fn();
+  await expect(preparePage(page, media(), () => {}, { timeout: 2000, resume: true, onUpload: uploaded })).resolves.toEqual([]);
+  expect(uploaded).not.toHaveBeenCalled();
+  expect(await page.evaluate(() => ({
+    uploads: (window as any).videoUploads,
+    title: document.querySelector<HTMLInputElement>('input[placeholder]')?.value,
+    covers: (window as any).covers,
+    submits: (window as any).submits,
+  }))).toEqual({ uploads: 0, title: '我的标题', covers: { '3:4': 'portrait.png', '4:3': 'landscape.jpg' }, submits: 0 });
+});
+
+it('上传失败的编辑页不续接', async () => {
+  const { page } = await pageFor('resume-failed');
+  await page.evaluate(() => {
+    document.querySelector<HTMLElement>('#editor')!.hidden = false;
+    document.querySelector('#upload-status')!.textContent = '上传失败';
+  });
+  expect(await canResume(page)).toBe(false);
+});
+
+it('只有进度条在走、文字不变时不算卡住，并按进度条报百分比', async () => {
+  const { page } = await pageFor('bar-only');
+  await page.evaluate(() => {
+    document.querySelector<HTMLInputElement>('.upload-input')!.onchange = () => {
+      document.querySelector<HTMLElement>('#editor')!.hidden = false;
+      const card = document.querySelector<HTMLElement>('.long-card-test')!;
+      card.innerHTML = '<span>上传中</span><div class="bar" role="progressbar" aria-valuemax="200" aria-valuenow="0" style="width: 0%; height: 2px"></div>';
+      const bar = card.querySelector<HTMLElement>('.bar')!;
+      let value = 0;
+      const timer = setInterval(() => {
+        value += 20;
+        if (value < 200) { bar.setAttribute('aria-valuenow', String(value)); bar.style.width = `${value / 2}%`; return; }
+        clearInterval(timer);
+        card.innerHTML = '<span id="upload-status">重新上传</span>';
+        document.querySelector<HTMLButtonElement>('#publish')!.disabled = false;
+      }, 120);
+    };
+  });
+  const messages: string[] = [];
+  await expect(preparePage(page, media(), (_f, message) => messages.push(message), { timeout: 1000 })).resolves.toEqual([]);
+  expect(messages).toEqual(expect.arrayContaining([expect.stringMatching(/^正在上传视频 [1-9]\d*%/)]));
+});
+
+it('上传中弹出验证：停下全部自动操作交给用户，验证没了再接着填写', async () => {
+  const { page } = await pageFor('verification');
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="captcha_container" style="display:none;width:300px;height:200px"></div>');
+    document.querySelector<HTMLInputElement>('.upload-input')!.onchange = () => {
+      document.querySelector<HTMLElement>('#editor')!.hidden = false;
+      document.querySelector('#upload-status')!.textContent = '上传中 30%';
+      // 上传途中抖音弹出安全验证（普通弹窗）；隐藏着的验证容器不算。
+      setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<div role="dialog" id="verify" style="width:320px;height:200px">安全验证 请完成下列验证后继续</div>'), 200);
+      setTimeout(() => {
+        document.querySelector('#upload-status')!.textContent = '重新上传';
+        document.querySelector<HTMLButtonElement>('#publish')!.disabled = false;
+      }, 400);
+    };
+  });
+  const events: string[] = [];
+  const done = preparePage(page, media(), (_f, message) => { if (message.includes('验证')) events.push('message'); }, {
+    timeout: 1000,
+    onPause: () => events.push('pause'),
+    onResume: () => events.push('resume'),
+  });
+  await expect.poll(() => events.includes('pause'), { timeout: 5000 }).toBe(true);
+  // 等用户验证的时候不填表，也不因为单步时限放弃。
+  await new Promise(r => setTimeout(r, 1500));
+  expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('');
+  expect(events).toEqual(['pause', 'message']);
+  await page.evaluate(() => document.querySelector('#verify')!.remove());
+  await expect(done).resolves.toEqual([]);
+  expect(events).toEqual(['pause', 'message', 'resume']);
+  expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('我的标题');
+});
+
+it('认得出抖音的验证组件与身份确认弹窗，不把封面弹窗当成验证', async () => {
+  const { page } = await pageFor('verification-kinds');
+  expect(await page.evaluate(scripts.verificationOpen)).toBe(false);
+  await page.evaluate(() => document.body.insertAdjacentHTML('beforeend', '<div class="dy-creator-content-modal" role="dialog" style="width:300px;height:200px">设置竖封面 完成</div>'));
+  expect(await page.evaluate(scripts.verificationOpen)).toBe(false);
+  await page.evaluate(() => document.body.insertAdjacentHTML('beforeend', '<iframe src="about:blank#captcha" style="width:300px;height:200px"></iframe>'));
+  expect(await page.evaluate(scripts.verificationOpen)).toBe(true);
+  await page.evaluate(() => { document.querySelector('iframe')!.remove(); document.body.insertAdjacentHTML('beforeend', '<div class="semi-modal" style="width:300px;height:200px">身份验证 请输入短信验证码</div>'); });
+  expect(await page.evaluate(scripts.verificationOpen)).toBe(true);
 });

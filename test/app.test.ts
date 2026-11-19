@@ -99,6 +99,86 @@ it('上传操作最后交给用户，断开自动化连接而保留浏览器', a
   expect(state.status).toBe('ready_to_publish'); expect(state.account.id).toBe(account.id);
   expect(state.video_sha256).toBe('abc');
 });
+it('视频交给抖音页面后记下成片摘要，供下次续接', async () => {
+  const { request, account, deps } = setup(); request.params = { account: account.id };
+  deps.prepare.mockImplementationOnce(async (_page, _draft, _progress, options) => { options?.onUpload?.(); return []; });
+  await runOperation('prepare', request, () => {}, deps);
+  expect(deps.prepare.mock.calls[0][3]).toMatchObject({ resume: false });
+  expect(new AccountStore(request.data_dir).lastUpload(account.id)).toBe('abc');
+  expect(fs.readdirSync(request.project_root)).toEqual(['production']);
+});
+it('窗口还停在同一个成片的编辑页时接着上次的上传，不跳回上传页', async () => {
+  const { request, account, deps, navigate, evaluate, disconnect } = setup(); request.params = { account: account.id };
+  new AccountStore(request.data_dir).recordUpload(account.id, 'abc');
+  deps.open.mockResolvedValueOnce({ disconnect, reused: true } as unknown as BrowserConnection);
+  evaluate.mockResolvedValueOnce(true).mockResolvedValueOnce({ state: 'uploading', text: '上传中 40%', percent: 40 });
+  await runOperation('prepare', request, () => {}, deps);
+  expect(navigate).not.toHaveBeenCalled();
+  expect(deps.prepare.mock.calls[0][3]).toMatchObject({ resume: true });
+});
+it('换了成片或页面已离开编辑页时回到上传页重新上传', async () => {
+  for (const [recorded, editor] of [['old', true], ['abc', false]] as const) {
+    const { request, account, deps, navigate, evaluate, disconnect } = setup(); request.params = { account: account.id };
+    new AccountStore(request.data_dir).recordUpload(account.id, recorded);
+    deps.open.mockResolvedValueOnce({ disconnect, reused: true } as unknown as BrowserConnection);
+    evaluate.mockResolvedValueOnce(editor).mockResolvedValueOnce({ state: 'ready', text: '重新上传', percent: null });
+    await runOperation('prepare', request, () => {}, deps);
+    expect(navigate).toHaveBeenCalledWith('https://creator.douyin.com/creator-micro/content/upload');
+    expect(deps.prepare.mock.calls[0][3]).toMatchObject({ resume: false });
+  }
+});
+it('视频交给抖音后才盖遮罩显示进度，登录与找上传入口时不盖；做完或失败都揭开', async () => {
+  for (const fail of [false, true]) {
+    const { request, account, deps, disconnect } = setup(); request.params = { account: account.id };
+    const busy = vi.fn(async () => {}), idle = vi.fn(async () => {});
+    deps.open.mockResolvedValueOnce({ disconnect, busy, idle } as unknown as BrowserConnection);
+    deps.prepare.mockImplementationOnce(async (_page, _draft, onProgress, options) => {
+      onProgress(0.1, '正在打开抖音视频上传页，请确认已登录');
+      expect(busy).not.toHaveBeenCalled();
+      options?.onUpload?.();
+      onProgress(0.4, '正在上传视频 57%，请保留抖音窗口');
+      if (fail) throw Error('抖音显示视频上传或处理失败');
+      return [];
+    });
+    const run = runOperation('prepare', request, () => {}, deps);
+    if (fail) await expect(run).rejects.toThrow('上传或处理失败'); else await run;
+    expect(busy.mock.calls).toEqual([['正在上传视频', 0.2], ['正在上传视频 57%，请保留抖音窗口', 0.4]]);
+    expect(idle).toHaveBeenCalledOnce();
+  }
+});
+it('抖音弹出验证时揭开遮罩交给用户，验证期间的进度不再盖上，验证完按最近的进度重新盖上', async () => {
+  const { request, account, deps, disconnect } = setup(); request.params = { account: account.id };
+  const calls: unknown[] = [];
+  const busy = vi.fn(async (...args: unknown[]) => { calls.push(['busy', ...args]); }), idle = vi.fn(async () => { calls.push('idle'); });
+  deps.open.mockResolvedValueOnce({ disconnect, busy, idle } as unknown as BrowserConnection);
+  deps.prepare.mockImplementationOnce(async (_page, _draft, onProgress, options) => {
+    options?.onUpload?.();
+    onProgress(0.3, '正在上传视频 29%，请保留抖音窗口');
+    options?.onPause?.();
+    onProgress(0.3, '抖音要求验证：请在抖音窗口完成验证，完成后自动继续');
+    options?.onResume?.();
+    onProgress(0.55, '正在填写标题、简介和话题');
+    return [];
+  });
+  await runOperation('prepare', request, () => {}, deps);
+  expect(calls).toEqual([
+    ['busy', '正在上传视频', 0.2],
+    ['busy', '正在上传视频 29%，请保留抖音窗口', 0.3],
+    'idle',
+    ['busy', '正在上传视频 29%，请保留抖音窗口', 0.3],
+    ['busy', '正在填写标题、简介和话题', 0.55],
+    'idle',
+  ]);
+});
+it('续接上次的上传时一开始就盖遮罩；旧片场不认遮罩命令时照常完成', async () => {
+  const { request, account, deps, evaluate, disconnect } = setup(); request.params = { account: account.id };
+  new AccountStore(request.data_dir).recordUpload(account.id, 'abc');
+  const busy = vi.fn(async () => { throw Error('网页操作无效'); }), idle = vi.fn(async () => { throw Error('网页操作无效'); });
+  deps.open.mockResolvedValueOnce({ disconnect, reused: true, busy, idle } as unknown as BrowserConnection);
+  evaluate.mockResolvedValueOnce(true).mockResolvedValueOnce({ state: 'uploading', text: '上传中', percent: null });
+  await expect(runOperation('prepare', request, () => {}, deps)).resolves.toMatchObject({ status: 'ready_to_publish' });
+  expect(busy).toHaveBeenCalledWith('接着上次的上传', 0.2);
+});
 it('封面等操作失败时保留窗口并写失败状态，不冒充已填写', async () => {
   const { request, account, deps, disconnect } = setup(); request.params = { account: account.id };
   deps.prepare.mockRejectedValueOnce(Error('封面失败'));

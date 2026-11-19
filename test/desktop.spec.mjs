@@ -78,8 +78,10 @@ test('真实插件在片场内上传填写，重新打开后可登录原账号�
     const wc = webContents.getAllWebContents().find(w => w.getURL().startsWith('https://creator.douyin.com/'));
     const result = await wc.executeJavaScript(`({ title: document.querySelector('input[placeholder]').value, body: document.querySelector('[contenteditable]').innerText, video: document.querySelector('input[accept="video/*"]').files[0].name, covers: window.covers, submits: window.submits })`);
     await wc.executeJavaScript(`document.querySelector('input[placeholder]').value='用户改过的标题'`);
-    const bar = webContents.getAllWebContents().find(w => w.getURL().startsWith('data:text/html'));
-    await bar.executeJavaScript(`document.querySelector('a').click()`);
+    // 工具栏与遮罩都是片场写的 data: 页面：点工具栏上的「返回片场」。
+    for (const bar of webContents.getAllWebContents().filter(w => w.getURL().startsWith('data:text/html'))) {
+      if (await bar.executeJavaScript(`(() => { const a = document.querySelector('a[href="https://onset.invalid/return"]'); a?.click(); return !!a; })()`)) break;
+    }
     return result;
   });
   expect(content).toEqual({ title: '片场内自动填写', body: '在客户端里检查并发布', video: 'final.mp4', covers: { '3:4': 'cover.png', '4:3': 'horizontal.png' }, submits: 0 });

@@ -14,7 +14,14 @@ export function validateBridge(value: unknown): BrowserBridge {
 export function connectBridge(value: unknown) {
   const bridge = validateBridge(value);
   let connected = true;
-  const request = async (body: Record<string, unknown>) => {
+  // 片场同一时间只处理一个请求（多的回 409）：遮罩进度这类不等结果的请求也排在队里，免得撞上页面命令。
+  let queue: Promise<unknown> = Promise.resolve();
+  const request = (body: Record<string, unknown>) => {
+    const run = queue.then(() => send(body));
+    queue = run.catch(() => {});
+    return run;
+  };
+  const send = async (body: Record<string, unknown>) => {
     if (!connected) throw Error('网页自动填写已结束');
     const response = await fetch(bridge.endpoint, {
       method: 'POST', headers: { authorization: `Bearer ${bridge.token}`, 'content-type': 'application/json' },
@@ -41,6 +48,8 @@ export async function openBrowser(_profile: string, options: OpenOptions): Promi
     attached: true, reused: opened.reused === true,
     send: (method, params = {}) => bridge.request({ action: 'command', method, params }),
     state: async () => { const s = await bridge.request({ action: 'state' }); return { open: s.open === true, visible: s.visible === true }; },
+    busy: async (message, progress) => { await bridge.request({ action: 'busy', message: message.slice(0, 80), progress }); },
+    idle: async () => { await bridge.request({ action: 'busy', active: false }); },
     close: async () => { await bridge.request({ action: 'close' }); },
     disconnect() { bridge.disconnect(); },
   };

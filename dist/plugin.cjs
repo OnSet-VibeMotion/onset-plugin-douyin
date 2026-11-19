@@ -7510,6 +7510,23 @@ var AccountStore = class {
     import_node_fs2.default.rmSync(import_node_path2.default.join(this.root, id), { recursive: true, force: true });
     import_node_fs2.default.rmSync(import_node_path2.default.join(import_node_fs2.default.realpathSync(this.dataDir), "web-sessions", id), { recursive: true, force: true });
   }
+  /**
+   * 这个账号的抖音窗口里最近一次由插件放进去的成片（sha256）。窗口还停在它的编辑页时，再点「上传并填写」接着这次的上传，
+   * 不重传。只记成片的摘要，不记项目路径与文案。
+   */
+  lastUpload(id) {
+    if (!accountID.test(id)) return void 0;
+    try {
+      const value = readSmallJSON(import_node_path2.default.join(this.root, id, "upload.json"));
+      return typeof value?.video_sha256 === "string" ? value.video_sha256 : void 0;
+    } catch {
+      return void 0;
+    }
+  }
+  recordUpload(id, videoHash) {
+    this.get(id);
+    atomicJSON(import_node_path2.default.join(childDirectory(this.root, id), "upload.json"), { video_sha256: videoHash, uploaded_at: (/* @__PURE__ */ new Date()).toISOString() });
+  }
   profile(id) {
     this.get(id);
     return childDirectory(this.root, `${id}/browser`);
@@ -7582,9 +7599,25 @@ function coverPreview({ selector, previous }) {
   return "";
 }
 function videoStatus() {
-  const status = [...document.querySelectorAll('[class*="long-card"], [class*="progress"], [role="alert"]')].filter((node) => node.getClientRects().length).map((node) => node.innerText).join("\n");
-  if (/上传失败|转码失败/.test(status)) return "failed";
-  return /重新上传|上传成功/.test(status) && !/正在上传|上传中|转码中/.test(status) ? "ready" : "waiting";
+  const nodes = [...document.querySelectorAll('[class*="long-card"], [class*="progress"], [role="alert"], [role="progressbar"]')].filter((node) => node.getClientRects().length);
+  const text2 = nodes.map((node) => node.innerText.trim()).filter(Boolean).join("\n").slice(0, 500);
+  const bars = nodes.flatMap((node) => [node, ...node.querySelectorAll('[role="progressbar"]')]);
+  const match = text2.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+  const bar = bars.find((node) => node.hasAttribute("aria-valuenow"));
+  const value = Number(bar?.getAttribute("aria-valuenow")), max = Number(bar?.getAttribute("aria-valuemax") || 100);
+  const percent = match ? Math.min(100, Number(match[1])) : bar && Number.isFinite(value) && max > 0 ? Math.min(100, Math.max(0, value / max * 100)) : null;
+  if (/上传失败|转码失败/.test(text2)) return { state: "failed", text: text2, percent };
+  if (/重新上传|上传成功/.test(text2) && !/正在上传|上传中|转码中/.test(text2)) return { state: "ready", text: text2, percent };
+  return { state: nodes.length ? "uploading" : "none", text: text2, percent };
+}
+function verificationOpen() {
+  const visible = (node) => node.getClientRects().length > 0 && node.offsetWidth > 20 && node.offsetHeight > 20;
+  const widgets = '#captcha_container, #captcha-verify-image, .captcha_verify_container, .captcha-verify-container, [class*="captcha_verify"], [class*="secsdk-captcha"], iframe[src*="captcha"], iframe[src*="verifycenter"], iframe[src*="verify.snssdk"]';
+  if ([...document.querySelectorAll(widgets)].some(visible)) return true;
+  return [...document.querySelectorAll('[role="dialog"], .semi-modal, [class*="modal"]')].some((dialog) => visible(dialog) && /安全验证|身份验证|身份校验|请完成.{0,6}验证|验证码|滑块|拖动.{0,4}完成/.test(dialog.innerText.slice(0, 300)));
+}
+function editorOpen() {
+  return [...document.querySelectorAll('input[placeholder*="\u4F5C\u54C1\u6807\u9898"]')].some((input) => input.getClientRects().length && !input.disabled);
 }
 function publishReady() {
   if ([...document.querySelectorAll('[role="dialog"], .dy-creator-content-modal')].some((dialog) => dialog.getClientRects().length)) return false;
@@ -7742,9 +7775,15 @@ var Page = class _Page {
     if (result.exceptionDetails) throw Error(result.exceptionDetails.exception?.description ?? "\u9875\u9762\u64CD\u4F5C\u5931\u8D25");
     return result.result.value;
   }
+  /** 每一步自动操作前的检查点（抖音弹出验证时停下交给用户），返回停了多少毫秒；没设就是 0。不能在里面调 waitFor。 */
+  guard;
+  async checkpoint() {
+    return this.guard ? this.guard() : 0;
+  }
   async waitFor(fn, timeout, message, arg) {
-    const deadline = Date.now() + timeout;
+    let deadline = Date.now() + timeout;
     do {
+      deadline += await this.checkpoint();
       try {
         if (await this.evaluate(fn, arg)) return;
       } catch (err) {
@@ -7812,7 +7851,14 @@ function validateBridge(value) {
 function connectBridge(value) {
   const bridge = validateBridge(value);
   let connected = true;
-  const request2 = async (body) => {
+  let queue = Promise.resolve();
+  const request2 = (body) => {
+    const run = queue.then(() => send(body));
+    queue = run.catch(() => {
+    });
+    return run;
+  };
+  const send = async (body) => {
     if (!connected) throw Error("\u7F51\u9875\u81EA\u52A8\u586B\u5199\u5DF2\u7ED3\u675F");
     const response = await fetch(bridge.endpoint, {
       method: "POST",
@@ -7844,6 +7890,12 @@ async function openBrowser(_profile, options) {
     state: async () => {
       const s = await bridge.request({ action: "state" });
       return { open: s.open === true, visible: s.visible === true };
+    },
+    busy: async (message, progress) => {
+      await bridge.request({ action: "busy", message: message.slice(0, 80), progress });
+    },
+    idle: async () => {
+      await bridge.request({ action: "busy", active: false });
     },
     close: async () => {
       await bridge.request({ action: "close" });
@@ -7934,26 +7986,67 @@ function pickCovers(root, images) {
 
 // src/prepare.ts
 var coverSteps = `${coverDialog} :is([role="tab"], [class^="step-"])`;
-async function preparePage(page, draft, progress, options = {}) {
+function verificationGuard(page, progress, last, options) {
+  const open = async (navigating) => {
+    try {
+      return await page.evaluate(verificationOpen);
+    } catch (err) {
+      if (/context/i.test(String(err))) return navigating;
+      throw err;
+    }
+  };
+  return async () => {
+    if (!await open(false)) return 0;
+    const started = Date.now();
+    options.onPause?.();
+    progress(last(), "\u6296\u97F3\u8981\u6C42\u9A8C\u8BC1\uFF1A\u8BF7\u5728\u6296\u97F3\u7A97\u53E3\u5B8C\u6210\u9A8C\u8BC1\uFF0C\u5B8C\u6210\u540E\u81EA\u52A8\u7EE7\u7EED");
+    await page.raw("Page.bringToFront").catch(() => {
+    });
+    while (await open(true)) await delay(1e3);
+    await delay(1e3);
+    options.onResume?.();
+    return Date.now() - started;
+  };
+}
+async function preparePage(page, draft, report, options = {}) {
   const timeout = options.timeout ?? 10 * 6e4;
-  progress(0.1, "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u9875\uFF0C\u8BF7\u786E\u8BA4\u5DF2\u767B\u5F55");
-  await page.waitFor(hasUpload, Math.min(timeout, 9e4), "\u627E\u4E0D\u5230\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u5165\u53E3\uFF0C\u8BF7\u68C0\u67E5\u767B\u5F55\u72B6\u6001\u548C\u9875\u9762\u540E\u91CD\u8BD5", videoInput);
-  progress(0.2, "\u6B63\u5728\u4E0A\u4F20\u89C6\u9891\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3");
-  await page.upload(videoInput, draft.video);
-  const deadline = Date.now() + timeout;
-  for (; ; ) {
-    const status = await page.evaluate(videoStatus);
-    if (status === "ready") break;
-    if (status === "failed") throw Error("\u6296\u97F3\u663E\u793A\u89C6\u9891\u4E0A\u4F20\u6216\u5904\u7406\u5931\u8D25\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
-    if (Date.now() >= deadline) throw Error("\u7B49\u5F85\u6296\u97F3\u4E0A\u4F20\u5B8C\u6210\u8D85\u65F6\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
-    await delay(Math.min(timeout, 500));
+  let fraction = 0;
+  const progress = (value, message) => {
+    fraction = value;
+    report(value, message);
+  };
+  const guard = () => {
+    page.guard = verificationGuard(page, report, () => fraction, options);
+  };
+  try {
+    return await fillPage(page, draft, progress, options, timeout, guard);
+  } finally {
+    page.guard = void 0;
   }
+}
+async function fillPage(page, draft, progress, options, timeout, guard) {
+  if (options.resume) {
+    guard();
+    progress(0.2, "\u6296\u97F3\u7A97\u53E3\u91CC\u5DF2\u6709\u8FD9\u4E2A\u6210\u7247\uFF0C\u63A5\u7740\u4E0A\u6B21\u7684\u4E0A\u4F20\u7EE7\u7EED");
+  } else {
+    progress(0.1, "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u9875\uFF0C\u8BF7\u786E\u8BA4\u5DF2\u767B\u5F55");
+    await page.waitFor(hasUpload, Math.min(timeout, 9e4), "\u627E\u4E0D\u5230\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u5165\u53E3\uFF0C\u8BF7\u68C0\u67E5\u767B\u5F55\u72B6\u6001\u548C\u9875\u9762\u540E\u91CD\u8BD5", videoInput);
+    progress(0.2, "\u6B63\u5728\u4E0A\u4F20\u89C6\u9891\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3");
+    await page.upload(videoInput, draft.video);
+    options.onUpload?.();
+    guard();
+  }
+  await waitForVideo(page, progress);
   progress(0.55, "\u6B63\u5728\u586B\u5199\u6807\u9898\u3001\u7B80\u4ECB\u548C\u8BDD\u9898");
+  await page.checkpoint();
   await page.fillTitle(draft.title);
+  await page.checkpoint();
   await page.fillContent(draft.content + (draft.tags.length ? "\n\n" : ""));
   for (const tag of draft.tags) {
+    await page.checkpoint();
     await page.type(`#${tag} `, 20);
   }
+  await page.checkpoint();
   const filled = await page.evaluate(filledContent);
   const normalize = (value) => value.replace(/\s+/g, " ").trim();
   if (filled.title !== draft.title || !normalize(filled.content).includes(normalize(draft.content))) {
@@ -7969,6 +8062,7 @@ async function preparePage(page, draft, progress, options = {}) {
       continue;
     }
     progress(0.7 + index * 0.1, `\u6B63\u5728\u8BBE\u7F6E${label}`);
+    await page.checkpoint();
     try {
       coverDialogContinued = await setCover(page, ratio, file, Math.min(timeout, 2e4), {
         continued: coverDialogContinued,
@@ -7987,8 +8081,38 @@ async function preparePage(page, draft, progress, options = {}) {
   progress(1, "\u89C6\u9891\u548C\u6587\u6848\u5DF2\u51C6\u5907\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u540E\u53D1\u5E03");
   return warnings;
 }
+async function waitForVideo(page, progress) {
+  let reported;
+  for (; ; ) {
+    await page.checkpoint();
+    let status;
+    try {
+      status = await page.evaluate(videoStatus);
+    } catch (err) {
+      if (!/context/i.test(String(err))) throw err;
+    }
+    if (status?.state === "ready") return;
+    if (status?.state === "failed") throw Error("\u6296\u97F3\u663E\u793A\u89C6\u9891\u4E0A\u4F20\u6216\u5904\u7406\u5931\u8D25\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
+    const percent = status?.percent == null ? null : Math.floor(status.percent);
+    if (status && percent !== reported) {
+      reported = percent;
+      progress(0.2 + 0.35 * (percent ?? 0) / 100, percent === null ? "\u6B63\u5728\u4E0A\u4F20\u89C6\u9891\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3" : `\u6B63\u5728\u4E0A\u4F20\u89C6\u9891 ${percent}%\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3`);
+    }
+    await delay(1e3);
+  }
+}
+async function canResume(page) {
+  try {
+    if (!await page.evaluate(editorOpen)) return false;
+    const status = await page.evaluate(videoStatus);
+    return status?.state === "uploading" || status?.state === "ready";
+  } catch {
+    return false;
+  }
+}
 async function setCover(page, ratio, file, timeout, { continued, next }) {
   if (!continued) {
+    await page.checkpoint();
     const mode = await page.evaluate(openCover, ratio);
     if (!mode) throw Error("\u627E\u4E0D\u5230\u5BF9\u5E94\u7684\u5C01\u9762\u5165\u53E3");
     await page.waitFor(dialogOpen, timeout, "\u5C01\u9762\u5F39\u7A97\u672A\u6253\u5F00");
@@ -8000,6 +8124,7 @@ async function setCover(page, ratio, file, timeout, { continued, next }) {
   await page.waitFor(hasUpload, timeout, "\u627E\u4E0D\u5230\u552F\u4E00\u7684\u5C01\u9762\u4E0A\u4F20\u63A7\u4EF6", coverInput);
   const selector = coverInput;
   const previous = await page.evaluate(coverPreview, { selector });
+  await page.checkpoint();
   await page.upload(selector, file);
   await page.waitFor(coverPreview, timeout, "\u5C01\u9762\u4E0A\u4F20\u540E\u672A\u51FA\u73B0\u65B0\u9884\u89C8", { selector, previous });
   if (next && await page.click(coverSteps, "\u8BBE\u7F6E\u6A2A\u5C01\u9762")) {
@@ -8007,13 +8132,13 @@ async function setCover(page, ratio, file, timeout, { continued, next }) {
     return true;
   }
   const done = `${coverDialog} :is(button, [role="button"])`;
-  const deadline = Date.now() + timeout;
-  while (!await page.click(done, "\u5B8C\u6210")) {
+  let deadline = Date.now() + timeout;
+  while (deadline += await page.checkpoint(), !await page.click(done, "\u5B8C\u6210")) {
     if (Date.now() >= deadline) throw Error("\u5C01\u9762\u5904\u7406\u672A\u5B8C\u6210");
     await delay(Math.min(timeout, 250));
   }
-  const finishDeadline = Date.now() + timeout;
-  while (await page.evaluate(dialogOpen)) {
+  let finishDeadline = Date.now() + timeout;
+  while (finishDeadline += await page.checkpoint(), await page.evaluate(dialogOpen)) {
     await page.evaluate(confirmCover);
     if (Date.now() >= finishDeadline) throw Error("\u5C01\u9762\u5F39\u7A97\u5C1A\u672A\u5173\u95ED");
     await delay(Math.min(timeout, 250));
@@ -8129,7 +8254,11 @@ async function runOperation(operation, raw, progress = () => {
       const browser = await deps.open(store.profile(account.id), { bridge: request2.browser, account: account.id, label: account.name, hint: draft ? "\u8BF7\u68C0\u67E5\u8D26\u53F7\u4E0E\u5185\u5BB9\uFF0C\u53D1\u5E03\u7531\u4F60\u786E\u8BA4" : "\u5982\u9700\u91CD\u65B0\u767B\u5F55\uFF0C\u8BF7\u5728\u8FD9\u91CC\u767B\u5F55\u539F\u6296\u97F3\u8D26\u53F7\uFF0C\u7247\u573A\u4F1A\u81EA\u52A8\u66F4\u65B0\u8D26\u53F7\u8D44\u6599" });
       try {
         const page = await deps.page(browser);
-        if (draft && browser.reused) await page.navigate(page.origin + UploadPath);
+        let resume = false;
+        if (draft && browser.reused) {
+          resume = store.lastUpload(account.id) === draft.videoHash && await canResume(page);
+          if (!resume) await page.navigate(page.origin + UploadPath);
+        }
         if (!draft) {
           const result2 = await refreshOpenAccount(browser, page, store, account, deps, (message) => {
             progress(0.1, message);
@@ -8138,10 +8267,41 @@ async function runOperation(operation, raw, progress = () => {
           account = result2.account;
           return result2;
         }
-        const warnings = await deps.prepare(page, draft, (fraction, message) => {
-          progress(fraction, message);
-          update({ status: "running", message, account });
-        });
+        let masked = false, paused = false, lastMessage = "", lastFraction = 0;
+        const mask = (message, fraction) => {
+          masked = true;
+          lastMessage = message;
+          lastFraction = Math.max(0, Math.min(1, fraction));
+          if (!paused) void browser.busy?.(lastMessage, lastFraction).catch(() => {
+          });
+        };
+        if (resume) mask("\u63A5\u7740\u4E0A\u6B21\u7684\u4E0A\u4F20", 0.2);
+        let warnings;
+        try {
+          warnings = await deps.prepare(page, draft, (fraction, message) => {
+            progress(fraction, message);
+            update({ status: "running", message, account });
+            if (masked && !paused) mask(message, fraction);
+          }, {
+            resume,
+            onUpload: () => {
+              store.recordUpload(account.id, draft.videoHash);
+              mask("\u6B63\u5728\u4E0A\u4F20\u89C6\u9891", 0.2);
+            },
+            onPause: () => {
+              paused = true;
+              if (masked) void browser.idle?.().catch(() => {
+              });
+            },
+            onResume: () => {
+              paused = false;
+              if (masked) mask(lastMessage, lastFraction);
+            }
+          });
+        } finally {
+          if (masked) await browser.idle?.().catch(() => {
+          });
+        }
         await page.raw("Page.bringToFront");
         return { status: "ready_to_publish", message: "\u5185\u5BB9\u5DF2\u586B\u597D\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u6838\u5BF9\u8D26\u53F7\u3001\u5C01\u9762\u548C\u6587\u6848\uFF0C\u518D\u624B\u52A8\u53D1\u5E03", account, warnings, video_sha256: draft.videoHash };
       } finally {

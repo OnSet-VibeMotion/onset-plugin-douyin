@@ -40,11 +40,41 @@ export function coverPreview({ selector, previous }: { selector: string; previou
   return '';
 }
 
-export function videoStatus(): 'ready' | 'failed' | 'waiting' {
-  const status = [...document.querySelectorAll<HTMLElement>('[class*="long-card"], [class*="progress"], [role="alert"]')]
-    .filter(node => node.getClientRects().length).map(node => node.innerText).join('\n');
-  if (/上传失败|转码失败/.test(status)) return 'failed';
-  return /重新上传|上传成功/.test(status) && !/正在上传|上传中|转码中/.test(status) ? 'ready' : 'waiting';
+/**
+ * 视频卡片上的上传状态。percent 取文字里的百分比，没有再看进度条的 aria-valuenow，读不到为 null。
+ * none 表示页面上没有视频卡片（还在上传入口页）。
+ */
+export interface VideoStatus { state: 'none' | 'uploading' | 'ready' | 'failed'; text: string; percent: number | null }
+export function videoStatus(): VideoStatus {
+  const nodes = [...document.querySelectorAll<HTMLElement>('[class*="long-card"], [class*="progress"], [role="alert"], [role="progressbar"]')]
+    .filter(node => node.getClientRects().length);
+  const text = nodes.map(node => node.innerText.trim()).filter(Boolean).join('\n').slice(0, 500);
+  const bars = nodes.flatMap(node => [node, ...node.querySelectorAll<HTMLElement>('[role="progressbar"]')]);
+  const match = text.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+  const bar = bars.find(node => node.hasAttribute('aria-valuenow'));
+  const value = Number(bar?.getAttribute('aria-valuenow')), max = Number(bar?.getAttribute('aria-valuemax') || 100);
+  const percent = match ? Math.min(100, Number(match[1]))
+    : bar && Number.isFinite(value) && max > 0 ? Math.min(100, Math.max(0, value / max * 100)) : null;
+  if (/上传失败|转码失败/.test(text)) return { state: 'failed', text, percent };
+  if (/重新上传|上传成功/.test(text) && !/正在上传|上传中|转码中/.test(text)) return { state: 'ready', text, percent };
+  return { state: nodes.length ? 'uploading' : 'none', text, percent };
+}
+
+/**
+ * 抖音弹出了要用户自己做的验证：滑块、点选验证码、短信或身份确认。字节的验证组件挂在 captcha / verify 容器或 iframe 里；
+ * 身份确认是普通弹窗，按标题文字认。只认看得见的。
+ */
+export function verificationOpen(): boolean {
+  const visible = (node: Element) => node.getClientRects().length > 0 && (node as HTMLElement).offsetWidth > 20 && (node as HTMLElement).offsetHeight > 20;
+  const widgets = '#captcha_container, #captcha-verify-image, .captcha_verify_container, .captcha-verify-container, [class*="captcha_verify"], [class*="secsdk-captcha"], iframe[src*="captcha"], iframe[src*="verifycenter"], iframe[src*="verify.snssdk"]';
+  if ([...document.querySelectorAll(widgets)].some(visible)) return true;
+  return [...document.querySelectorAll<HTMLElement>('[role="dialog"], .semi-modal, [class*="modal"]')]
+    .some(dialog => visible(dialog) && /安全验证|身份验证|身份校验|请完成.{0,6}验证|验证码|滑块|拖动.{0,4}完成/.test(dialog.innerText.slice(0, 300)));
+}
+
+/** 页面停在作品编辑页（选好视频后才有标题框）。 */
+export function editorOpen(): boolean {
+  return [...document.querySelectorAll<HTMLInputElement>('input[placeholder*="作品标题"]')].some(input => input.getClientRects().length && !input.disabled);
 }
 
 export function publishReady(): boolean {
