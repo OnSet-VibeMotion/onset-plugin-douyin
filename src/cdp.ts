@@ -89,6 +89,16 @@ export class Page {
   /** 每一步自动操作前的检查点（抖音弹出验证时停下交给用户），返回停了多少毫秒；没设就是 0。不能在里面调 waitFor。 */
   guard?: () => Promise<number>;
   async checkpoint(): Promise<number> { return this.guard ? this.guard() : 0; }
+  /**
+   * 在页面里启动一个异步函数、不等结果（片场的网页连接同一时间只处理一个请求，等它就挡住了别的命令）；
+   * 结果存在页面上，之后用 page-scripts 的 takeLaunched(key) 取。
+   */
+  async launch<A>(key: string, fn: (arg: A) => Promise<unknown>, arg: A): Promise<void> {
+    const expression = `(() => { if (location.origin !== ${JSON.stringify(this.origin)}) throw new Error('页面已离开创作者中心，请重新打开'); `
+      + `(window.__onsetLaunched ??= {})[${JSON.stringify(key)}] = (${fn.toString()})(${JSON.stringify(arg)}); return true; })()`;
+    const result = await this.raw('Runtime.evaluate', { expression, returnByValue: true });
+    if (result.exceptionDetails) throw Error(result.exceptionDetails.exception?.description ?? '页面操作失败');
+  }
   async waitFor<A = undefined>(fn: (arg: A) => unknown, timeout: number, message: string, arg?: A): Promise<void> {
     let deadline = Date.now() + timeout;
     do {

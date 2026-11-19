@@ -266,13 +266,13 @@ export interface PublishedWork { title: string; duration: number; create_time: n
  * 这个账号最近的作品（创作者中心作品管理用的接口，2026-11-19 核对过字段：item_title、duration 毫秒、create_time 秒、status）。
  * 读不到返回 null。
  */
-export async function recentWorks(pages: number): Promise<PublishedWork[] | null> {
+export async function recentWorks({ pages, count = 12 }: { pages: number; count?: number }): Promise<PublishedWork[] | null> {
   const works: PublishedWork[] = [];
   let cursor = '0';
   for (let page = 0; page < pages; page++) {
     let data: any;
     try {
-      const response = await fetch(`/janus/douyin/creator/pc/work_list?status=0&count=12&max_cursor=${cursor}&scene=star_atlas&device_platform=android&aid=1128`, {
+      const response = await fetch(`/janus/douyin/creator/pc/work_list?status=0&count=${count}&max_cursor=${cursor}&scene=star_atlas&device_platform=android&aid=1128`, {
         credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(8000),
       });
       if (!response.ok) return page ? works : null;
@@ -295,4 +295,12 @@ export async function recentWorks(pages: number): Promise<PublishedWork[] | null
 export function editorVideoDuration(): number | null {
   const durations = [...document.querySelectorAll('video')].map(video => video.duration).filter(value => Number.isFinite(value) && value > 0);
   return durations.length ? Math.max(...durations) : null;
+}
+
+/** 取 Page.launch 存在页面上的结果；页面跳转过、没启动过就返回 undefined，调用方自己再查一次。 */
+export async function takeLaunched(key: string): Promise<unknown> {
+  const store = (window as any).__onsetLaunched ?? {};
+  const pending = store[key];
+  delete store[key];
+  return pending === undefined ? undefined : await pending;
 }

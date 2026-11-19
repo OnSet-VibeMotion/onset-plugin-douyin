@@ -448,3 +448,17 @@ it('标题或简介读回来对不上时只提醒，照样设好横竖两张封�
   expect(await page.evaluate(() => ({ covers: (window as any).covers, submits: (window as any).submits })))
     .toEqual({ covers: { '3:4': 'portrait.png', '4:3': 'landscape.jpg' }, submits: 0 });
 });
+
+it('抖音不支持的话题（带连字符等）直接跳过，不输入也不提醒；没有草稿时不干等', async () => {
+  const { page } = await pageFor('topics-and-speed');
+  const draft = { ...media(), tags: ['U-Net', '深度学习', 'AI_Agent', 'v1.0'] };
+  const started = Date.now();
+  const warnings = await preparePage(page, draft, () => {}, { timeout: 5000 });
+  // 以前没有草稿时也要等满 3 秒看提示出不出来。
+  expect(Date.now() - started).toBeLessThan(2500);
+  expect(warnings).toEqual([]);
+  const body = await page.evaluate(() => document.querySelector<HTMLElement>('.zone-container')!.innerText);
+  expect(body).toMatch(/#深度学习\s+#AI_Agent/);
+  expect(body).not.toContain('U-Net');
+  expect(body).not.toContain('v1.0');
+});

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { stringify } from 'yaml';
 import { AccountStore, newAccountID, withAccountLock } from '../src/accounts';
 import { mp4Duration, readDraft } from '../src/draft';
-import { findPublished, sameFilm, sameText } from '../src/prepare';
+import { douyinTopics, findPublished, sameFilm, sameText } from '../src/prepare';
 import { projectFile, writeProjectJSON } from '../src/files';
 
 const roots: string[] = [];
@@ -191,4 +191,8 @@ describe('核对填进页面的文字', () => {
     expect(sameText('它给出的答案是一个 U 形网络。', expected, true)).toBe(false);
     expect(sameText('PaperMark｜U-Net', 'PaperMark｜U-Net 十年')).toBe(false);
   });
+});
+
+it('抖音话题只留文字、字母、数字和下划线', () => {
+  expect(douyinTopics(['papermark', '科普新锐扶持计划', 'U-Net', '深度学习', 'AI_Agent', 'v1.0', 'two words', 'GPT4'])).toEqual(['papermark', '科普新锐扶持计划', '深度学习', 'AI_Agent', 'GPT4']);
 });

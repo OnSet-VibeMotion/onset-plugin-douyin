@@ -19,6 +19,17 @@ export interface PrepareOptions {
   again?: boolean;
 }
 
+/** 查重时看最近多少条作品（接口约 60 毫秒一条）。 */
+export const RecentWorksCount = 20;
+
+/**
+ * 抖音话题只认文字、字母、数字和下划线：带连字符、空格、点之类的（例如「U-Net」）输不成话题，直接跳过，
+ * 不输进简介、也不提醒（2026-11-19 真实页面上「#U-Net」没变成话题）。
+ */
+export function douyinTopics(tags: string[]): string[] {
+  return tags.filter(tag => /^[\p{L}\p{N}_]+$/u.test(tag));
+}
+
 /** 这个成片已经在这个账号发过（或在审核）：不上传，交给用户决定。 */
 export class AlreadyPublished extends Error {
   constructor(readonly work: scripts.PublishedWork) {
@@ -56,11 +67,11 @@ export function sameFilm(saved: { size: number; lastModified: number }, draft: D
  * 不替用户放弃它，也不上传把它顶掉。没有草稿返回 false。
  */
 async function restoreDraft(page: Page, draft: Draft, timeout: number): Promise<boolean> {
-  // 提示比上传框晚一点出来：稍等一下再判断。
-  try { await page.waitFor(scripts.draftPromptOpen, Math.min(timeout, 3000), ''); }
-  catch { return false; }
+  // 草稿记在本地存储里：没有记录就不会有提示，不用干等。有记录时提示比上传框晚一点出来，稍等一下再判断。
   const saved = await page.evaluate(scripts.savedDraftFile);
   if (!saved) return false;
+  try { await page.waitFor(scripts.draftPromptOpen, Math.min(timeout, 3000), ''); }
+  catch { return false; }
   if (!sameFilm(saved, draft)) {
     const mb = (saved.size / 1024 / 1024).toFixed(1);
     throw Error(`这个抖音账号还有一个没发完的视频（${saved.name || '未命名'}，${mb} MB），继续上传会把它替换掉。请先在抖音窗口里处理它：继续编辑并发布，或点「放弃」，再点「上传并填写」`);
@@ -112,13 +123,16 @@ async function fillPage(page: Page, draft: Draft, progress: Progress, options: P
     progress(0.2, '抖音窗口里已有这个成片，接着上次的上传继续');
   } else {
     progress(0.1, '正在打开抖音视频上传页，请确认已登录');
+    // 已发布作品先在页面里开始查，和找上传框、看草稿同时进行，用的时候再取结果。
+    if (!options.again) await page.launch('works', scripts.recentWorks, { pages: 1, count: RecentWorksCount }).catch(() => {});
     await page.waitFor(scripts.hasUpload, Math.min(timeout, 90_000), '找不到抖音视频上传入口，请检查登录状态和页面后重试', scripts.videoInput);
     if (await restoreDraft(page, draft, timeout)) {
       progress(0.2, '抖音草稿里就是这个成片，接着上次的上传继续');
     } else {
       if (!options.again) {
         progress(0.15, '正在检查这个成片是否已经发过');
-        const works = await page.evaluate(scripts.recentWorks, 4).catch(() => null);
+        let works = await page.evaluate(scripts.takeLaunched, 'works').catch(() => undefined) as scripts.PublishedWork[] | null | undefined;
+        if (works === undefined) works = await page.evaluate(scripts.recentWorks, { pages: 1, count: RecentWorksCount }).catch(() => null);
         const published = works && findPublished(works, draft);
         if (published) throw new AlreadyPublished(published);
         if (!works) warnings.push('没能读到这个账号已发布的作品，没有检查这个成片是否发过，请在抖音页面留意。');
@@ -135,8 +149,9 @@ async function fillPage(page: Page, draft: Draft, progress: Progress, options: P
   await page.checkpoint();
   await page.fillTitle(draft.title);
   await page.checkpoint();
-  await page.fillContent(draft.content + (draft.tags.length ? '\n\n' : ''));
-  for (const tag of draft.tags) {
+  const topics = douyinTopics(draft.tags);
+  await page.fillContent(draft.content + (topics.length ? '\n\n' : ''));
+  for (const tag of topics) {
     await page.checkpoint();
     await page.type(`#${tag} `, 20);
   }
@@ -145,7 +160,7 @@ async function fillPage(page: Page, draft: Draft, progress: Progress, options: P
   // 对不上只提醒、不中断：封面照样要设，发布前用户本来就要在抖音页面核对一遍。
   if (!sameText(filled.title, draft.title)) warnings.push('抖音页面上的标题与发布信息不一致，请在抖音页面检查标题。');
   if (!sameText(filled.content, draft.content, true)) warnings.push('抖音页面上的简介与发布信息不一致，请在抖音页面检查简介。');
-  warnings.push(...draft.tags.filter(tag => !filled.content.includes('#' + tag))
+  warnings.push(...topics.filter(tag => !filled.content.includes('#' + tag))
     .map(tag => `请在抖音页面检查话题「${tag}」是否已加入。`));
 
   let coverDialogContinued = false;

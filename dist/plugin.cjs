@@ -7762,13 +7762,13 @@ function continueDraft() {
   candidates[0].click();
   return true;
 }
-async function recentWorks(pages) {
+async function recentWorks({ pages, count = 12 }) {
   const works = [];
   let cursor = "0";
   for (let page = 0; page < pages; page++) {
     let data;
     try {
-      const response = await fetch(`/janus/douyin/creator/pc/work_list?status=0&count=12&max_cursor=${cursor}&scene=star_atlas&device_platform=android&aid=1128`, {
+      const response = await fetch(`/janus/douyin/creator/pc/work_list?status=0&count=${count}&max_cursor=${cursor}&scene=star_atlas&device_platform=android&aid=1128`, {
         credentials: "same-origin",
         cache: "no-store",
         signal: AbortSignal.timeout(8e3)
@@ -7796,6 +7796,12 @@ async function recentWorks(pages) {
 function editorVideoDuration() {
   const durations = [...document.querySelectorAll("video")].map((video) => video.duration).filter((value) => Number.isFinite(value) && value > 0);
   return durations.length ? Math.max(...durations) : null;
+}
+async function takeLaunched(key) {
+  const store = window.__onsetLaunched ?? {};
+  const pending = store[key];
+  delete store[key];
+  return pending === void 0 ? void 0 : await pending;
 }
 
 // src/cdp.ts
@@ -7845,6 +7851,15 @@ var Page = class _Page {
   guard;
   async checkpoint() {
     return this.guard ? this.guard() : 0;
+  }
+  /**
+   * 在页面里启动一个异步函数、不等结果（片场的网页连接同一时间只处理一个请求，等它就挡住了别的命令）；
+   * 结果存在页面上，之后用 page-scripts 的 takeLaunched(key) 取。
+   */
+  async launch(key, fn, arg) {
+    const expression = `(() => { if (location.origin !== ${JSON.stringify(this.origin)}) throw new Error('\u9875\u9762\u5DF2\u79BB\u5F00\u521B\u4F5C\u8005\u4E2D\u5FC3\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00'); (window.__onsetLaunched ??= {})[${JSON.stringify(key)}] = (${fn.toString()})(${JSON.stringify(arg)}); return true; })()`;
+    const result = await this.raw("Runtime.evaluate", { expression, returnByValue: true });
+    if (result.exceptionDetails) throw Error(result.exceptionDetails.exception?.description ?? "\u9875\u9762\u64CD\u4F5C\u5931\u8D25");
   }
   async waitFor(fn, timeout, message, arg) {
     let deadline = Date.now() + timeout;
@@ -8106,6 +8121,10 @@ function pickCovers(root, images) {
 
 // src/prepare.ts
 var coverSteps = `${coverDialog} :is([role="tab"], [class^="step-"])`;
+var RecentWorksCount = 20;
+function douyinTopics(tags) {
+  return tags.filter((tag) => /^[\p{L}\p{N}_]+$/u.test(tag));
+}
 var AlreadyPublished = class extends Error {
   constructor(work) {
     const day = new Date(work.create_time * 1e3);
@@ -8128,13 +8147,13 @@ function sameFilm(saved, draft) {
   return draft.videoSize !== void 0 && draft.videoModified !== void 0 && saved.size === draft.videoSize && Math.abs(saved.lastModified - draft.videoModified) <= 1;
 }
 async function restoreDraft(page, draft, timeout) {
+  const saved = await page.evaluate(savedDraftFile);
+  if (!saved) return false;
   try {
     await page.waitFor(draftPromptOpen, Math.min(timeout, 3e3), "");
   } catch {
     return false;
   }
-  const saved = await page.evaluate(savedDraftFile);
-  if (!saved) return false;
   if (!sameFilm(saved, draft)) {
     const mb = (saved.size / 1024 / 1024).toFixed(1);
     throw Error(`\u8FD9\u4E2A\u6296\u97F3\u8D26\u53F7\u8FD8\u6709\u4E00\u4E2A\u6CA1\u53D1\u5B8C\u7684\u89C6\u9891\uFF08${saved.name || "\u672A\u547D\u540D"}\uFF0C${mb} MB\uFF09\uFF0C\u7EE7\u7EED\u4E0A\u4F20\u4F1A\u628A\u5B83\u66FF\u6362\u6389\u3002\u8BF7\u5148\u5728\u6296\u97F3\u7A97\u53E3\u91CC\u5904\u7406\u5B83\uFF1A\u7EE7\u7EED\u7F16\u8F91\u5E76\u53D1\u5E03\uFF0C\u6216\u70B9\u300C\u653E\u5F03\u300D\uFF0C\u518D\u70B9\u300C\u4E0A\u4F20\u5E76\u586B\u5199\u300D`);
@@ -8188,13 +8207,16 @@ async function fillPage(page, draft, progress, options, timeout, guard) {
     progress(0.2, "\u6296\u97F3\u7A97\u53E3\u91CC\u5DF2\u6709\u8FD9\u4E2A\u6210\u7247\uFF0C\u63A5\u7740\u4E0A\u6B21\u7684\u4E0A\u4F20\u7EE7\u7EED");
   } else {
     progress(0.1, "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u9875\uFF0C\u8BF7\u786E\u8BA4\u5DF2\u767B\u5F55");
+    if (!options.again) await page.launch("works", recentWorks, { pages: 1, count: RecentWorksCount }).catch(() => {
+    });
     await page.waitFor(hasUpload, Math.min(timeout, 9e4), "\u627E\u4E0D\u5230\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u5165\u53E3\uFF0C\u8BF7\u68C0\u67E5\u767B\u5F55\u72B6\u6001\u548C\u9875\u9762\u540E\u91CD\u8BD5", videoInput);
     if (await restoreDraft(page, draft, timeout)) {
       progress(0.2, "\u6296\u97F3\u8349\u7A3F\u91CC\u5C31\u662F\u8FD9\u4E2A\u6210\u7247\uFF0C\u63A5\u7740\u4E0A\u6B21\u7684\u4E0A\u4F20\u7EE7\u7EED");
     } else {
       if (!options.again) {
         progress(0.15, "\u6B63\u5728\u68C0\u67E5\u8FD9\u4E2A\u6210\u7247\u662F\u5426\u5DF2\u7ECF\u53D1\u8FC7");
-        const works = await page.evaluate(recentWorks, 4).catch(() => null);
+        let works = await page.evaluate(takeLaunched, "works").catch(() => void 0);
+        if (works === void 0) works = await page.evaluate(recentWorks, { pages: 1, count: RecentWorksCount }).catch(() => null);
         const published = works && findPublished(works, draft);
         if (published) throw new AlreadyPublished(published);
         if (!works) warnings.push("\u6CA1\u80FD\u8BFB\u5230\u8FD9\u4E2A\u8D26\u53F7\u5DF2\u53D1\u5E03\u7684\u4F5C\u54C1\uFF0C\u6CA1\u6709\u68C0\u67E5\u8FD9\u4E2A\u6210\u7247\u662F\u5426\u53D1\u8FC7\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u7559\u610F\u3002");
@@ -8210,8 +8232,9 @@ async function fillPage(page, draft, progress, options, timeout, guard) {
   await page.checkpoint();
   await page.fillTitle(draft.title);
   await page.checkpoint();
-  await page.fillContent(draft.content + (draft.tags.length ? "\n\n" : ""));
-  for (const tag of draft.tags) {
+  const topics = douyinTopics(draft.tags);
+  await page.fillContent(draft.content + (topics.length ? "\n\n" : ""));
+  for (const tag of topics) {
     await page.checkpoint();
     await page.type(`#${tag} `, 20);
   }
@@ -8219,7 +8242,7 @@ async function fillPage(page, draft, progress, options, timeout, guard) {
   const filled = await page.evaluate(filledContent);
   if (!sameText(filled.title, draft.title)) warnings.push("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u6807\u9898\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u6807\u9898\u3002");
   if (!sameText(filled.content, draft.content, true)) warnings.push("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u7B80\u4ECB\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u7B80\u4ECB\u3002");
-  warnings.push(...draft.tags.filter((tag) => !filled.content.includes("#" + tag)).map((tag) => `\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u8BDD\u9898\u300C${tag}\u300D\u662F\u5426\u5DF2\u52A0\u5165\u3002`));
+  warnings.push(...topics.filter((tag) => !filled.content.includes("#" + tag)).map((tag) => `\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u8BDD\u9898\u300C${tag}\u300D\u662F\u5426\u5DF2\u52A0\u5165\u3002`));
   let coverDialogContinued = false;
   for (const [index, ratio] of coverRatios.entries()) {
     const label = ratio === "3:4" ? "3:4 \u7AD6\u5C01\u9762" : "4:3 \u6A2A\u5C01\u9762";
