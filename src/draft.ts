@@ -12,6 +12,11 @@ export interface Draft {
   tags: string[];
   video: string;
   videoHash: string;
+  /** 文件大小与修改时间（毫秒）：抖音把没发完的视频记在网页本地存储里，带着这两项，据此认出草稿里是不是这个成片。 */
+  videoSize?: number;
+  videoModified?: number;
+  /** 成片时长（毫秒），读不出来为 null：和已发布作品的时长比对。 */
+  videoDuration?: number | null;
   covers: Partial<Record<CoverRatio, string>>;
 }
 function record(value: unknown): Record<string, unknown> {
@@ -65,7 +70,52 @@ export async function readDraft(root: string): Promise<Draft> {
   const videoHash = hash.digest('hex');
   if (video.sha256 && video.sha256 !== videoHash) throw Error('成片已变动，请先刷新发布信息');
   const covers = pickCovers(root, cover.images);
-  return { title, content, tags: normalizedTags, video: videoPath, videoHash, covers };
+  const stat = fs.statSync(videoPath);
+  return {
+    title, content, tags: normalizedTags, video: videoPath, videoHash, covers,
+    videoSize: stat.size, videoModified: Math.floor(stat.mtimeMs), videoDuration: mp4Duration(videoPath),
+  };
+}
+
+/**
+ * 读 MP4 / MOV 的时长（moov/mvhd，毫秒）。只按盒子头跳着读，不读整个文件；读不出来返回 null。
+ */
+export function mp4Duration(file: string): number | null {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const read = (offset: number, length: number) => {
+      const buffer = Buffer.alloc(length);
+      return buffer.subarray(0, fs.readSync(fd!, buffer, 0, length, offset));
+    };
+    const boxes = function* (start: number, end: number) {
+      let offset = start;
+      while (offset + 8 <= end) {
+        const head = read(offset, 16);
+        if (head.length < 8) return;
+        let length = head.readUInt32BE(0), header = 8;
+        if (length === 1) { if (head.length < 16) return; length = Number(head.readBigUInt64BE(8)); header = 16; }
+        else if (length === 0) length = end - offset;
+        if (length < header) return;
+        yield { type: head.toString('latin1', 4, 8), start: offset + header, end: Math.min(offset + length, end) };
+        offset += length;
+      }
+    };
+    for (const top of boxes(0, size)) {
+      if (top.type !== 'moov') continue;
+      for (const box of boxes(top.start, top.end)) {
+        if (box.type !== 'mvhd') continue;
+        const body = read(box.start, 32);
+        const version = body[0];
+        const scale = version === 1 ? body.readUInt32BE(20) : body.readUInt32BE(12);
+        const duration = version === 1 ? Number(body.readBigUInt64BE(24)) : body.readUInt32BE(16);
+        return scale ? Math.round(duration * 1000 / scale) : null;
+      }
+    }
+    return null;
+  } catch { return null; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
 function pickCovers(root: string, images: unknown): Draft['covers'] {

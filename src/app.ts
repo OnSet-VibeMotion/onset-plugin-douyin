@@ -5,7 +5,7 @@ import { delay, Page, UploadPath, type BrowserConnection } from './cdp';
 import * as scripts from './page-scripts';
 import { readDraft } from './draft';
 import { writeProjectJSON } from './files';
-import { canResume, preparePage, type Progress } from './prepare';
+import { AlreadyPublished, canResume, editorHoldsFilm, preparePage, type Progress } from './prepare';
 
 export interface Request {
   /** 空字符串：没打开项目时从片场设置里点的账号操作，不往项目里写任何东西。 */
@@ -50,7 +50,7 @@ export function validateRequest(raw: unknown): Request {
   if (typeof r.data_dir !== 'string' || !path.isAbsolute(r.data_dir)) throw Error('data_dir 需要绝对路径');
   if (typeof r.project_root !== 'string' || (r.project_root !== '' && !path.isAbsolute(r.project_root))) throw Error('project_root 需要绝对路径');
   const params = object(r.params ?? {}), settings = object(r.settings ?? {});
-  for (const key of Object.keys(params)) if (!['account'].includes(key)) throw Error(`不支持参数 ${key}；插件不会自动发布`);
+  for (const key of Object.keys(params)) if (!['account', 'again'].includes(key)) throw Error(`不支持参数 ${key}；插件不会自动发布`);
   for (const value of Object.values(params)) if (typeof value !== 'string' || value.length > 500) throw Error('参数需要字符串');
   const browser = r.browser === undefined ? undefined : validateBridge(r.browser);
   return { project_root: r.project_root, data_dir: r.data_dir, params, settings, browser };
@@ -115,10 +115,11 @@ export async function runOperation(operation: string, raw: unknown, progress: Pr
       const browser = await deps.open(store.profile(account!.id), { bridge: request.browser, account: account!.id, label: account!.name, hint: draft ? '请检查账号与内容，发布由你确认' : '如需重新登录，请在这里登录原抖音账号，片场会自动更新账号资料' });
       try {
         const page = await deps.page(browser);
-        // 窗口还停在这个成片的编辑页（上次等上传时中断了）：接着用，不跳回上传页重传。换了成片或页面已离开编辑页才重新上传。
+        // 窗口还停在这个成片的编辑页（上次等上传时中断了，或在抖音草稿里点了「继续编辑」）：接着用，不跳回上传页重传。
+        // 是不是这个成片：插件记下的指纹，或编辑页里视频的时长。换了成片或页面已离开编辑页才重新上传。
         let resume = false;
         if (draft && browser.reused) {
-          resume = store.lastUpload(account!.id) === draft.videoHash && await canResume(page);
+          resume = await canResume(page) && (store.lastUpload(account!.id) === draft.videoHash || await editorHoldsFilm(page, draft));
           if (!resume) await page.navigate(page.origin + UploadPath);
         }
         if (!draft) {
@@ -146,10 +147,15 @@ export async function runOperation(operation: string, raw: unknown, progress: Pr
             if (masked && !paused) mask(message, fraction);
           }, {
             resume,
+            again: params.again === '1',
             onUpload: () => { store.recordUpload(account!.id, draft.videoHash); mask('正在上传视频', 0.2); },
             onPause: () => { paused = true; if (masked) void browser.idle?.().catch(() => {}); },
             onResume: () => { paused = false; if (masked) mask(lastMessage, lastFraction); },
           });
+        } catch (err) {
+          // 这个成片已经发过：不算失败，交给用户在插件页面决定要不要「仍然上传」。
+          if (err instanceof AlreadyPublished) return { status: 'already_published', message: err.message, account };
+          throw err;
         } finally {
           if (masked) await browser.idle?.().catch(() => {});
         }

@@ -15,6 +15,49 @@ export interface PrepareOptions {
   /** 抖音弹出验证：调用方揭开遮罩交给用户（onPause）；验证没了、接着自动操作前再盖上（onResume）。 */
   onPause?: () => void;
   onResume?: () => void;
+  /** 这个成片已经发过也照样上传（用户在插件页面点了「仍然上传」）。 */
+  again?: boolean;
+}
+
+/** 这个成片已经在这个账号发过（或在审核）：不上传，交给用户决定。 */
+export class AlreadyPublished extends Error {
+  constructor(readonly work: scripts.PublishedWork) {
+    const day = new Date(work.create_time * 1000);
+    const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+    super(`这个成片 ${date} 已经发到这个抖音账号了（「${work.title}」${work.reviewing ? '，正在审核' : ''}${work.is_private ? '，仅自己可见' : ''}），这次没有上传。确实要再发一次，请点「仍然上传」`);
+  }
+}
+
+/** 已发布作品里有没有这个成片：标题相同、时长相差不到 1.5 秒（读不出成片时长时只看标题）。 */
+export function findPublished(works: scripts.PublishedWork[], draft: Draft): scripts.PublishedWork | undefined {
+  const same = (a: string, b: string) => a.replace(/\s+/g, '') === b.replace(/\s+/g, '');
+  return works.find(work => same(work.title, draft.title)
+    && (draft.videoDuration == null || Math.abs(work.duration - draft.videoDuration) <= 1500));
+}
+
+/** 抖音草稿里的视频是不是这个成片：大小一样、修改时间（毫秒）一样。 */
+export function sameFilm(saved: { size: number; lastModified: number }, draft: Draft): boolean {
+  return draft.videoSize !== undefined && draft.videoModified !== undefined
+    && saved.size === draft.videoSize && Math.abs(saved.lastModified - draft.videoModified) <= 1;
+}
+
+/**
+ * 上传页上有「上次未发布的视频」时：是这个成片就点「继续编辑」接着用（返回 true）；是别的视频就停下，
+ * 不替用户放弃它，也不上传把它顶掉。没有草稿返回 false。
+ */
+async function restoreDraft(page: Page, draft: Draft, timeout: number): Promise<boolean> {
+  // 提示比上传框晚一点出来：稍等一下再判断。
+  try { await page.waitFor(scripts.draftPromptOpen, Math.min(timeout, 3000), ''); }
+  catch { return false; }
+  const saved = await page.evaluate(scripts.savedDraftFile);
+  if (!saved) return false;
+  if (!sameFilm(saved, draft)) {
+    const mb = (saved.size / 1024 / 1024).toFixed(1);
+    throw Error(`这个抖音账号还有一个没发完的视频（${saved.name || '未命名'}，${mb} MB），继续上传会把它替换掉。请先在抖音窗口里处理它：继续编辑并发布，或点「放弃」，再点「上传并填写」`);
+  }
+  if (!await page.evaluate(scripts.continueDraft)) throw Error('抖音草稿里就是这个成片，但没点到「继续编辑」，请在抖音窗口里点一下后再试');
+  await page.waitFor(scripts.editorOpen, Math.min(timeout, 60_000), '点了「继续编辑」，但抖音编辑页没有打开，请在窗口检查');
+  return true;
 }
 
 /**
@@ -53,14 +96,26 @@ export async function preparePage(page: Page, draft: Draft, report: Progress, op
 }
 
 async function fillPage(page: Page, draft: Draft, progress: Progress, options: PrepareOptions, timeout: number, guard: () => void): Promise<string[]> {
+  const warnings: string[] = [];
   if (options.resume) {
     guard();
     progress(0.2, '抖音窗口里已有这个成片，接着上次的上传继续');
   } else {
     progress(0.1, '正在打开抖音视频上传页，请确认已登录');
     await page.waitFor(scripts.hasUpload, Math.min(timeout, 90_000), '找不到抖音视频上传入口，请检查登录状态和页面后重试', scripts.videoInput);
-    progress(0.2, '正在上传视频，请保留抖音窗口');
-    await page.upload(scripts.videoInput, draft.video);
+    if (await restoreDraft(page, draft, timeout)) {
+      progress(0.2, '抖音草稿里就是这个成片，接着上次的上传继续');
+    } else {
+      if (!options.again) {
+        progress(0.15, '正在检查这个成片是否已经发过');
+        const works = await page.evaluate(scripts.recentWorks, 4).catch(() => null);
+        const published = works && findPublished(works, draft);
+        if (published) throw new AlreadyPublished(published);
+        if (!works) warnings.push('没能读到这个账号已发布的作品，没有检查这个成片是否发过，请在抖音页面留意。');
+      }
+      progress(0.2, '正在上传视频，请保留抖音窗口');
+      await page.upload(scripts.videoInput, draft.video);
+    }
     options.onUpload?.();
     guard();
   }
@@ -81,8 +136,8 @@ async function fillPage(page: Page, draft: Draft, progress: Progress, options: P
   if (filled.title !== draft.title || !normalize(filled.content).includes(normalize(draft.content))) {
     throw Error('抖音页面上的标题或简介与发布信息不符，请在窗口检查');
   }
-  const warnings = draft.tags.filter(tag => !filled.content.includes('#' + tag))
-    .map(tag => `请在抖音页面检查话题「${tag}」是否已加入。`);
+  warnings.push(...draft.tags.filter(tag => !filled.content.includes('#' + tag))
+    .map(tag => `请在抖音页面检查话题「${tag}」是否已加入。`));
 
   let coverDialogContinued = false;
   for (const [index, ratio] of coverRatios.entries()) {
@@ -134,6 +189,17 @@ async function waitForVideo(page: Page, progress: Progress): Promise<void> {
     }
     await delay(1000);
   }
+}
+
+/**
+ * 编辑页里的视频是不是这个成片：时长与成片相差不到 50 毫秒。插件没记下指纹时（例如旧版插件传的、或在抖音草稿里点了「继续编辑」）靠它认。
+ */
+export async function editorHoldsFilm(page: Page, draft: Draft): Promise<boolean> {
+  if (draft.videoDuration == null) return false;
+  try {
+    const seconds = await page.evaluate(scripts.editorVideoDuration);
+    return seconds !== null && Math.abs(seconds * 1000 - draft.videoDuration) <= 50;
+  } catch { return false; }
 }
 
 /** 上次的操作中断后再点：窗口停在编辑页、视频还在传或已传好，就能接着用（是不是同一个成片由调用方核对）。 */

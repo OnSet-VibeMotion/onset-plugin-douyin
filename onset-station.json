@@ -4,7 +4,7 @@
     "onset": "0.1.0"
   },
   "id": "douyin-upload",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "name": "抖音上传助手",
   "description": "选择抖音账号，在片场客户端内自动上传成片、封面并填入文案，最后由你检查并发布。",
   "after": "publish",
@@ -27,6 +27,11 @@
             "is": "ready_to_publish",
             "status": "done",
             "detail": "已填写，请在抖音页面手动发布"
+          },
+          {
+            "is": "already_published",
+            "status": "done",
+            "detail": "这个成片已经发到抖音了"
           },
           {
             "is": "running",
@@ -135,6 +140,10 @@
           "type": "string",
           "description": "账号编号",
           "required": true
+        },
+        "again": {
+          "type": "string",
+          "description": "这个成片已经发过也照样上传（填 1）"
         }
       }
     }

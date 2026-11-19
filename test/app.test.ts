@@ -5,7 +5,7 @@ import path from 'node:path';
 import { runOperation, validateRequest } from '../src/app';
 import { AccountStore, newAccountID } from '../src/accounts';
 import type { BrowserConnection, Page } from '../src/cdp';
-import type { preparePage } from '../src/prepare';
+import { AlreadyPublished, type preparePage } from '../src/prepare';
 
 const roots: string[] = [];
 function temp() { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'onset-douyin-app-')); roots.push(dir); return dir; }
@@ -116,6 +116,17 @@ it('窗口还停在同一个成片的编辑页时接着上次的上传，不跳�
   expect(navigate).not.toHaveBeenCalled();
   expect(deps.prepare.mock.calls[0][3]).toMatchObject({ resume: true });
 });
+it('插件没记过指纹时，编辑页里视频时长与成片对得上（例如在抖音草稿里点了「继续编辑」）也接着用', async () => {
+  for (const [seconds, resumed] of [[531.466667, true], [301.739, false]] as const) {
+    const { request, account, deps, navigate, evaluate, disconnect } = setup(); request.params = { account: account.id };
+    deps.draft.mockResolvedValueOnce({ title: '标题', content: '正文', tags: [], video: '/movie.mp4', covers: {}, videoHash: 'abc', videoDuration: 531_467 } as never);
+    deps.open.mockResolvedValueOnce({ disconnect, reused: true } as unknown as BrowserConnection);
+    evaluate.mockResolvedValueOnce(true).mockResolvedValueOnce({ state: 'ready', text: '添加音乐 重新上传', percent: null }).mockResolvedValueOnce(seconds);
+    await runOperation('prepare', request, () => {}, deps);
+    expect(navigate).toHaveBeenCalledTimes(resumed ? 0 : 1);
+    expect(deps.prepare.mock.calls[0][3]).toMatchObject({ resume: resumed });
+  }
+});
 it('换了成片或页面已离开编辑页时回到上传页重新上传', async () => {
   for (const [recorded, editor] of [['old', true], ['abc', false]] as const) {
     const { request, account, deps, navigate, evaluate, disconnect } = setup(); request.params = { account: account.id };
@@ -178,6 +189,17 @@ it('续接上次的上传时一开始就盖遮罩；旧片场不认遮罩命令�
   evaluate.mockResolvedValueOnce(true).mockResolvedValueOnce({ state: 'uploading', text: '上传中', percent: null });
   await expect(runOperation('prepare', request, () => {}, deps)).resolves.toMatchObject({ status: 'ready_to_publish' });
   expect(busy).toHaveBeenCalledWith('接着上次的上传', 0.2);
+});
+it('成片已经发过时不算失败，状态写成 already_published；「仍然上传」带 again', async () => {
+  const { request, account, deps } = setup(); request.params = { account: account.id };
+  deps.prepare.mockRejectedValueOnce(new AlreadyPublished({ title: '标题', duration: 1000, create_time: 1795007766, reviewing: false, is_private: false }));
+  const result = await runOperation('prepare', request, () => {}, deps);
+  expect(result).toMatchObject({ status: 'already_published', message: expect.stringContaining('已经发到这个抖音账号了') });
+  expect(JSON.parse(fs.readFileSync(path.join(request.project_root, 'production/douyin/state.json'), 'utf8')).status).toBe('already_published');
+  expect(deps.prepare.mock.calls[0][3]).toMatchObject({ again: false });
+  request.params = { account: account.id, again: '1' };
+  await runOperation('prepare', request, () => {}, deps);
+  expect(deps.prepare.mock.calls[1][3]).toMatchObject({ again: true });
 });
 it('封面等操作失败时保留窗口并写失败状态，不冒充已填写', async () => {
   const { request, account, deps, disconnect } = setup(); request.params = { account: account.id };

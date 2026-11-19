@@ -5,7 +5,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { openBrowser, findBrowser } from './support/browser';
 import { CDP, Page } from '../src/cdp';
-import { canResume, preparePage } from '../src/prepare';
+import { AlreadyPublished, canResume, preparePage } from '../src/prepare';
 import * as scripts from '../src/page-scripts';
 
 let root: string, origin: string, server: http.Server;
@@ -13,7 +13,9 @@ const browsers: Awaited<ReturnType<typeof openBrowser>>[] = [];
 const fixture = fs.readFileSync(new URL('./fixtures/creator.html', import.meta.url), 'utf8');
 beforeAll(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'onset-douyin-browser-'));
-  server = http.createServer((_req, res) => {
+  server = http.createServer((req, res) => {
+    // 作品列表接口：默认这个账号还没发过任何作品。
+    if (req.url?.startsWith('/janus/')) { res.setHeader('Content-Type', 'application/json'); res.end('{"status_code":0,"aweme_list":[],"has_more":false}'); return; }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.end(fixture);
   });
@@ -49,8 +51,9 @@ async function pageFor(name: string) {
 function media() {
   const video = path.join(root, 'video.mp4'), portrait = path.join(root, 'portrait.png'), landscape = path.join(root, 'landscape.jpg');
   for (const file of [video, portrait, landscape]) fs.writeFileSync(file, 'test');
+  const stat = fs.statSync(video);
   return { title: '我的标题', content: '视频简介', tags: ['科技', '开源'], video, videoHash: 'hash',
-    covers: { '3:4': portrait, '4:3': landscape } };
+    covers: { '3:4': portrait, '4:3': landscape }, videoSize: stat.size, videoModified: Math.floor(stat.mtimeMs), videoDuration: 180_000 };
 }
 it('上传视频、填写标题简介和话题、设置两张封面，发布仍由用户操作', async () => {
   const { page } = await pageFor('upload-both');
@@ -359,4 +362,75 @@ it('认得出抖音的验证组件与身份确认弹窗，不把封面弹窗当�
   expect(await page.evaluate(scripts.verificationOpen)).toBe(true);
   await page.evaluate(() => { document.querySelector('iframe')!.remove(); document.body.insertAdjacentHTML('beforeend', '<div class="semi-modal" style="width:300px;height:200px">身份验证 请输入短信验证码</div>'); });
   expect(await page.evaluate(scripts.verificationOpen)).toBe(true);
+});
+
+
+/** 上传页顶上的「上次未发布的视频」提示，结构照真实页面（2026-11-19 核对）；草稿记在本地存储里。 */
+async function withSavedDraft(page: Page, file: { size: number; lastModified: number }) {
+  await page.evaluate((saved) => {
+    localStorage.setItem('publish_form_cache:123', JSON.stringify({ cache: { longFileInfo: { name: 'final.mp4', ...saved, duration: 180 } } }));
+    (window as any).videoUploads = 0; (window as any).gaveUp = 0;
+    document.querySelector<HTMLInputElement>('.upload-input')!.addEventListener('change', () => (window as any).videoUploads++);
+    document.body.insertAdjacentHTML('afterbegin', '<div class="draft"><div><span class="hint-text-x">你还有上次未发布的视频，是否继续编辑？</span><span class="hint-text-x continue-x">继续编辑</span><span class="hint-text-x give-up-x">放弃</span></div></div>');
+    document.querySelector<HTMLElement>('.continue-x')!.onclick = () => {
+      document.querySelector('.draft')!.remove();
+      history.pushState(null, '', '/creator-micro/content/post/video?enter_from=draft');
+      document.querySelector<HTMLElement>('#editor')!.hidden = false;
+      document.querySelector('#upload-status')!.textContent = '添加音乐 重新上传';
+      document.querySelector<HTMLButtonElement>('#publish')!.disabled = false;
+    };
+    document.querySelector<HTMLElement>('.give-up-x')!.onclick = () => (window as any).gaveUp++;
+  }, file);
+}
+
+it('抖音草稿里就是这个成片：点「继续编辑」接着填写，不重新上传', async () => {
+  const { page } = await pageFor('draft-same');
+  const draft = media();
+  await withSavedDraft(page, { size: draft.videoSize, lastModified: draft.videoModified });
+  const uploaded = vi.fn();
+  await expect(preparePage(page, draft, () => {}, { timeout: 2000, onUpload: uploaded })).resolves.toEqual([]);
+  expect(uploaded).toHaveBeenCalledOnce();
+  expect(await page.evaluate(() => ({ uploads: (window as any).videoUploads, gaveUp: (window as any).gaveUp, title: document.querySelector<HTMLInputElement>('input[placeholder]')?.value, submits: (window as any).submits })))
+    .toEqual({ uploads: 0, gaveUp: 0, title: '我的标题', submits: 0 });
+});
+
+it('抖音草稿里是别的视频：停下请用户处理，不替用户放弃，也不上传顶掉它', async () => {
+  const { page } = await pageFor('draft-other');
+  const draft = media();
+  await withSavedDraft(page, { size: draft.videoSize + 1, lastModified: draft.videoModified });
+  await expect(preparePage(page, draft, () => {}, { timeout: 2000 })).rejects.toThrow(/还有一个没发完的视频（final\.mp4.*放弃/);
+  expect(await page.evaluate(() => ({ uploads: (window as any).videoUploads, gaveUp: (window as any).gaveUp, prompt: !!document.querySelector('.draft') })))
+    .toEqual({ uploads: 0, gaveUp: 0, prompt: true });
+});
+
+it('这个成片已经发过：不上传，说明何时发的；点了「仍然上传」才上传', async () => {
+  const { page } = await pageFor('published');
+  const fakeWorks = () => page.evaluate(() => {
+    (window as any).videoUploads = 0;
+    document.querySelector<HTMLInputElement>('.upload-input')!.addEventListener('change', () => (window as any).videoUploads++);
+    const real = window.fetch;
+    window.fetch = async (input, init) => String(input).startsWith('/janus/douyin/creator/pc/work_list')
+      ? Response.json({ status_code: 0, has_more: false, aweme_list: [
+        { item_title: '别的作品', duration: 180_000, create_time: 1795000000, status: {} },
+        { item_title: '我的 标题', duration: 180_600, create_time: 1795007766, status: { in_reviewing: true } },
+      ] })
+      : real(input, init);
+  });
+  await fakeWorks();
+  const error = await preparePage(page, media(), () => {}, { timeout: 2000 }).catch(err => err);
+  expect(error).toBeInstanceOf(AlreadyPublished);
+  expect(error.message).toMatch(/已经发到这个抖音账号了（「我的 标题」，正在审核）.*仍然上传/);
+  expect(await page.evaluate(() => (window as any).videoUploads)).toBe(0);
+  await expect(preparePage(page, media(), () => {}, { timeout: 2000, again: true })).resolves.toEqual([]);
+  expect(await page.evaluate(() => (window as any).videoUploads)).toBe(1);
+});
+
+it('读不到已发布作品时照常上传，并提醒用户留意', async () => {
+  const { page } = await pageFor('works-unreadable');
+  await page.evaluate(() => {
+    const real = window.fetch;
+    window.fetch = async (input, init) => String(input).startsWith('/janus/') ? new Response('', { status: 500 }) : real(input, init);
+  });
+  await expect(preparePage(page, media(), () => {}, { timeout: 2000 })).resolves.toEqual([expect.stringContaining('没能读到这个账号已发布的作品')]);
+  expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('我的标题');
 });

@@ -1,6 +1,6 @@
 {
   "name": "onset-plugin-douyin",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "description": "片场抖音插件：客户端内自动上传填写，多账号独立登录，用户检查并发布",

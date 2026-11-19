@@ -216,3 +216,83 @@ export async function loginInfo(): Promise<LoginInfo | null> {
   if (!fast || !media || fast.user_id !== media.user_id) return fast ?? media;
   return { name: fast.name || media.name, avatar: fast.avatar || media.avatar, user_id: fast.user_id };
 }
+
+/**
+ * 上传页顶上的「你还有上次未发布的视频，是否继续编辑？」（2026-11-19 在真实页面上核对过：
+ * span.hint-text-* 提示，后面是 span.continue-*「继续编辑」与 span.give-up-*「放弃」）。
+ */
+export function draftPromptOpen(): boolean {
+  return [...document.querySelectorAll<HTMLElement>('span, div, p')].some(node =>
+    node.childElementCount === 0 && node.getClientRects().length > 0 && /上次未发布的视频/.test(node.textContent ?? ''));
+}
+
+/**
+ * 那个没发完的视频：抖音存在网页本地存储 publish_form_cache:<用户编号> 的 cache.longFileInfo 里，
+ * 带着本地文件的名字、大小与修改时间（毫秒，与文件的 mtime 一致）。没有就是 null。
+ */
+export function savedDraftFile(): { name: string; size: number; lastModified: number; duration: number | null } | null {
+  for (const key of Object.keys(localStorage)) {
+    if (!key.startsWith('publish_form_cache:')) continue;
+    try {
+      const value = JSON.parse(localStorage.getItem(key) ?? 'null');
+      const file = value?.cache?.longFileInfo ?? value?.cache?.longFileMetaInfo;
+      if (file && typeof file.size === 'number' && typeof file.lastModified === 'number') {
+        return { name: String(file.name ?? ''), size: file.size, lastModified: file.lastModified, duration: typeof file.duration === 'number' ? file.duration : null };
+      }
+    } catch { /* 读不懂的不算 */ }
+  }
+  return null;
+}
+
+/** 点草稿提示里的「继续编辑」。只点这一个，不碰「放弃」。 */
+export function continueDraft(): boolean {
+  const nearPrompt = (node: HTMLElement) => {
+    let parent = node.parentElement;
+    for (let level = 0; parent && level < 4; level++, parent = parent.parentElement) {
+      if (/上次未发布的视频/.test(parent.innerText.slice(0, 200))) return true;
+    }
+    return false;
+  };
+  const buttons = [...document.querySelectorAll<HTMLElement>('span, button, [role="button"]')].filter(node =>
+    node.getClientRects().length > 0 && node.textContent?.trim() === '继续编辑' && nearPrompt(node));
+  const candidates = buttons.filter(node => !buttons.some(other => other !== node && node.contains(other)));
+  if (candidates.length !== 1) return false;
+  candidates[0].click();
+  return true;
+}
+
+export interface PublishedWork { title: string; duration: number; create_time: number; reviewing: boolean; is_private: boolean }
+/**
+ * 这个账号最近的作品（创作者中心作品管理用的接口，2026-11-19 核对过字段：item_title、duration 毫秒、create_time 秒、status）。
+ * 读不到返回 null。
+ */
+export async function recentWorks(pages: number): Promise<PublishedWork[] | null> {
+  const works: PublishedWork[] = [];
+  let cursor = '0';
+  for (let page = 0; page < pages; page++) {
+    let data: any;
+    try {
+      const response = await fetch(`/janus/douyin/creator/pc/work_list?status=0&count=12&max_cursor=${cursor}&scene=star_atlas&device_platform=android&aid=1128`, {
+        credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(8000),
+      });
+      if (!response.ok) return page ? works : null;
+      data = await response.json();
+    } catch { return page ? works : null; }
+    if (data?.status_code !== 0 || !Array.isArray(data.aweme_list)) return page ? works : null;
+    for (const item of data.aweme_list) {
+      works.push({
+        title: String(item.item_title || item.desc || ''), duration: Number(item.duration ?? item.video?.duration ?? 0),
+        create_time: Number(item.create_time ?? 0), reviewing: item.status?.in_reviewing === true, is_private: item.status?.is_private === true,
+      });
+    }
+    if (!data.has_more) break;
+    cursor = String(data.max_cursor);
+  }
+  return works;
+}
+
+/** 编辑页里预览视频的时长（秒）：抖音从服务器载入已经传上去的视频。没有为 null。 */
+export function editorVideoDuration(): number | null {
+  const durations = [...document.querySelectorAll('video')].map(video => video.duration).filter(value => Number.isFinite(value) && value > 0);
+  return durations.length ? Math.max(...durations) : null;
+}

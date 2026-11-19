@@ -7731,6 +7731,72 @@ async function loginInfo() {
   if (!fast || !media || fast.user_id !== media.user_id) return fast ?? media;
   return { name: fast.name || media.name, avatar: fast.avatar || media.avatar, user_id: fast.user_id };
 }
+function draftPromptOpen() {
+  return [...document.querySelectorAll("span, div, p")].some((node) => node.childElementCount === 0 && node.getClientRects().length > 0 && /上次未发布的视频/.test(node.textContent ?? ""));
+}
+function savedDraftFile() {
+  for (const key of Object.keys(localStorage)) {
+    if (!key.startsWith("publish_form_cache:")) continue;
+    try {
+      const value = JSON.parse(localStorage.getItem(key) ?? "null");
+      const file = value?.cache?.longFileInfo ?? value?.cache?.longFileMetaInfo;
+      if (file && typeof file.size === "number" && typeof file.lastModified === "number") {
+        return { name: String(file.name ?? ""), size: file.size, lastModified: file.lastModified, duration: typeof file.duration === "number" ? file.duration : null };
+      }
+    } catch {
+    }
+  }
+  return null;
+}
+function continueDraft() {
+  const nearPrompt = (node) => {
+    let parent = node.parentElement;
+    for (let level = 0; parent && level < 4; level++, parent = parent.parentElement) {
+      if (/上次未发布的视频/.test(parent.innerText.slice(0, 200))) return true;
+    }
+    return false;
+  };
+  const buttons = [...document.querySelectorAll('span, button, [role="button"]')].filter((node) => node.getClientRects().length > 0 && node.textContent?.trim() === "\u7EE7\u7EED\u7F16\u8F91" && nearPrompt(node));
+  const candidates = buttons.filter((node) => !buttons.some((other) => other !== node && node.contains(other)));
+  if (candidates.length !== 1) return false;
+  candidates[0].click();
+  return true;
+}
+async function recentWorks(pages) {
+  const works = [];
+  let cursor = "0";
+  for (let page = 0; page < pages; page++) {
+    let data;
+    try {
+      const response = await fetch(`/janus/douyin/creator/pc/work_list?status=0&count=12&max_cursor=${cursor}&scene=star_atlas&device_platform=android&aid=1128`, {
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: AbortSignal.timeout(8e3)
+      });
+      if (!response.ok) return page ? works : null;
+      data = await response.json();
+    } catch {
+      return page ? works : null;
+    }
+    if (data?.status_code !== 0 || !Array.isArray(data.aweme_list)) return page ? works : null;
+    for (const item of data.aweme_list) {
+      works.push({
+        title: String(item.item_title || item.desc || ""),
+        duration: Number(item.duration ?? item.video?.duration ?? 0),
+        create_time: Number(item.create_time ?? 0),
+        reviewing: item.status?.in_reviewing === true,
+        is_private: item.status?.is_private === true
+      });
+    }
+    if (!data.has_more) break;
+    cursor = String(data.max_cursor);
+  }
+  return works;
+}
+function editorVideoDuration() {
+  const durations = [...document.querySelectorAll("video")].map((video) => video.duration).filter((value) => Number.isFinite(value) && value > 0);
+  return durations.length ? Math.max(...durations) : null;
+}
 
 // src/cdp.ts
 var CreatorOrigin = "https://creator.douyin.com";
@@ -7962,7 +8028,61 @@ ${attribution}`;
   const videoHash = hash.digest("hex");
   if (video.sha256 && video.sha256 !== videoHash) throw Error("\u6210\u7247\u5DF2\u53D8\u52A8\uFF0C\u8BF7\u5148\u5237\u65B0\u53D1\u5E03\u4FE1\u606F");
   const covers = pickCovers(root, cover.images);
-  return { title, content, tags: normalizedTags, video: videoPath, videoHash, covers };
+  const stat = import_node_fs3.default.statSync(videoPath);
+  return {
+    title,
+    content,
+    tags: normalizedTags,
+    video: videoPath,
+    videoHash,
+    covers,
+    videoSize: stat.size,
+    videoModified: Math.floor(stat.mtimeMs),
+    videoDuration: mp4Duration(videoPath)
+  };
+}
+function mp4Duration(file) {
+  let fd;
+  try {
+    fd = import_node_fs3.default.openSync(file, "r");
+    const size = import_node_fs3.default.fstatSync(fd).size;
+    const read = (offset, length) => {
+      const buffer = Buffer.alloc(length);
+      return buffer.subarray(0, import_node_fs3.default.readSync(fd, buffer, 0, length, offset));
+    };
+    const boxes = function* (start, end) {
+      let offset = start;
+      while (offset + 8 <= end) {
+        const head = read(offset, 16);
+        if (head.length < 8) return;
+        let length = head.readUInt32BE(0), header = 8;
+        if (length === 1) {
+          if (head.length < 16) return;
+          length = Number(head.readBigUInt64BE(8));
+          header = 16;
+        } else if (length === 0) length = end - offset;
+        if (length < header) return;
+        yield { type: head.toString("latin1", 4, 8), start: offset + header, end: Math.min(offset + length, end) };
+        offset += length;
+      }
+    };
+    for (const top of boxes(0, size)) {
+      if (top.type !== "moov") continue;
+      for (const box of boxes(top.start, top.end)) {
+        if (box.type !== "mvhd") continue;
+        const body = read(box.start, 32);
+        const version = body[0];
+        const scale = version === 1 ? body.readUInt32BE(20) : body.readUInt32BE(12);
+        const duration = version === 1 ? Number(body.readBigUInt64BE(24)) : body.readUInt32BE(16);
+        return scale ? Math.round(duration * 1e3 / scale) : null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== void 0) import_node_fs3.default.closeSync(fd);
+  }
 }
 function pickCovers(root, images) {
   if (images === void 0) return {};
@@ -7986,6 +8106,38 @@ function pickCovers(root, images) {
 
 // src/prepare.ts
 var coverSteps = `${coverDialog} :is([role="tab"], [class^="step-"])`;
+var AlreadyPublished = class extends Error {
+  constructor(work) {
+    const day = new Date(work.create_time * 1e3);
+    const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+    super(`\u8FD9\u4E2A\u6210\u7247 ${date} \u5DF2\u7ECF\u53D1\u5230\u8FD9\u4E2A\u6296\u97F3\u8D26\u53F7\u4E86\uFF08\u300C${work.title}\u300D${work.reviewing ? "\uFF0C\u6B63\u5728\u5BA1\u6838" : ""}${work.is_private ? "\uFF0C\u4EC5\u81EA\u5DF1\u53EF\u89C1" : ""}\uFF09\uFF0C\u8FD9\u6B21\u6CA1\u6709\u4E0A\u4F20\u3002\u786E\u5B9E\u8981\u518D\u53D1\u4E00\u6B21\uFF0C\u8BF7\u70B9\u300C\u4ECD\u7136\u4E0A\u4F20\u300D`);
+    this.work = work;
+  }
+  work;
+};
+function findPublished(works, draft) {
+  const same = (a, b) => a.replace(/\s+/g, "") === b.replace(/\s+/g, "");
+  return works.find((work) => same(work.title, draft.title) && (draft.videoDuration == null || Math.abs(work.duration - draft.videoDuration) <= 1500));
+}
+function sameFilm(saved, draft) {
+  return draft.videoSize !== void 0 && draft.videoModified !== void 0 && saved.size === draft.videoSize && Math.abs(saved.lastModified - draft.videoModified) <= 1;
+}
+async function restoreDraft(page, draft, timeout) {
+  try {
+    await page.waitFor(draftPromptOpen, Math.min(timeout, 3e3), "");
+  } catch {
+    return false;
+  }
+  const saved = await page.evaluate(savedDraftFile);
+  if (!saved) return false;
+  if (!sameFilm(saved, draft)) {
+    const mb = (saved.size / 1024 / 1024).toFixed(1);
+    throw Error(`\u8FD9\u4E2A\u6296\u97F3\u8D26\u53F7\u8FD8\u6709\u4E00\u4E2A\u6CA1\u53D1\u5B8C\u7684\u89C6\u9891\uFF08${saved.name || "\u672A\u547D\u540D"}\uFF0C${mb} MB\uFF09\uFF0C\u7EE7\u7EED\u4E0A\u4F20\u4F1A\u628A\u5B83\u66FF\u6362\u6389\u3002\u8BF7\u5148\u5728\u6296\u97F3\u7A97\u53E3\u91CC\u5904\u7406\u5B83\uFF1A\u7EE7\u7EED\u7F16\u8F91\u5E76\u53D1\u5E03\uFF0C\u6216\u70B9\u300C\u653E\u5F03\u300D\uFF0C\u518D\u70B9\u300C\u4E0A\u4F20\u5E76\u586B\u5199\u300D`);
+  }
+  if (!await page.evaluate(continueDraft)) throw Error("\u6296\u97F3\u8349\u7A3F\u91CC\u5C31\u662F\u8FD9\u4E2A\u6210\u7247\uFF0C\u4F46\u6CA1\u70B9\u5230\u300C\u7EE7\u7EED\u7F16\u8F91\u300D\uFF0C\u8BF7\u5728\u6296\u97F3\u7A97\u53E3\u91CC\u70B9\u4E00\u4E0B\u540E\u518D\u8BD5");
+  await page.waitFor(editorOpen, Math.min(timeout, 6e4), "\u70B9\u4E86\u300C\u7EE7\u7EED\u7F16\u8F91\u300D\uFF0C\u4F46\u6296\u97F3\u7F16\u8F91\u9875\u6CA1\u6709\u6253\u5F00\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
+  return true;
+}
 function verificationGuard(page, progress, last, options) {
   const open = async (navigating) => {
     try {
@@ -8025,14 +8177,26 @@ async function preparePage(page, draft, report, options = {}) {
   }
 }
 async function fillPage(page, draft, progress, options, timeout, guard) {
+  const warnings = [];
   if (options.resume) {
     guard();
     progress(0.2, "\u6296\u97F3\u7A97\u53E3\u91CC\u5DF2\u6709\u8FD9\u4E2A\u6210\u7247\uFF0C\u63A5\u7740\u4E0A\u6B21\u7684\u4E0A\u4F20\u7EE7\u7EED");
   } else {
     progress(0.1, "\u6B63\u5728\u6253\u5F00\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u9875\uFF0C\u8BF7\u786E\u8BA4\u5DF2\u767B\u5F55");
     await page.waitFor(hasUpload, Math.min(timeout, 9e4), "\u627E\u4E0D\u5230\u6296\u97F3\u89C6\u9891\u4E0A\u4F20\u5165\u53E3\uFF0C\u8BF7\u68C0\u67E5\u767B\u5F55\u72B6\u6001\u548C\u9875\u9762\u540E\u91CD\u8BD5", videoInput);
-    progress(0.2, "\u6B63\u5728\u4E0A\u4F20\u89C6\u9891\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3");
-    await page.upload(videoInput, draft.video);
+    if (await restoreDraft(page, draft, timeout)) {
+      progress(0.2, "\u6296\u97F3\u8349\u7A3F\u91CC\u5C31\u662F\u8FD9\u4E2A\u6210\u7247\uFF0C\u63A5\u7740\u4E0A\u6B21\u7684\u4E0A\u4F20\u7EE7\u7EED");
+    } else {
+      if (!options.again) {
+        progress(0.15, "\u6B63\u5728\u68C0\u67E5\u8FD9\u4E2A\u6210\u7247\u662F\u5426\u5DF2\u7ECF\u53D1\u8FC7");
+        const works = await page.evaluate(recentWorks, 4).catch(() => null);
+        const published = works && findPublished(works, draft);
+        if (published) throw new AlreadyPublished(published);
+        if (!works) warnings.push("\u6CA1\u80FD\u8BFB\u5230\u8FD9\u4E2A\u8D26\u53F7\u5DF2\u53D1\u5E03\u7684\u4F5C\u54C1\uFF0C\u6CA1\u6709\u68C0\u67E5\u8FD9\u4E2A\u6210\u7247\u662F\u5426\u53D1\u8FC7\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u7559\u610F\u3002");
+      }
+      progress(0.2, "\u6B63\u5728\u4E0A\u4F20\u89C6\u9891\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3");
+      await page.upload(videoInput, draft.video);
+    }
     options.onUpload?.();
     guard();
   }
@@ -8052,7 +8216,7 @@ async function fillPage(page, draft, progress, options, timeout, guard) {
   if (filled.title !== draft.title || !normalize(filled.content).includes(normalize(draft.content))) {
     throw Error("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u6807\u9898\u6216\u7B80\u4ECB\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u7B26\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
   }
-  const warnings = draft.tags.filter((tag) => !filled.content.includes("#" + tag)).map((tag) => `\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u8BDD\u9898\u300C${tag}\u300D\u662F\u5426\u5DF2\u52A0\u5165\u3002`);
+  warnings.push(...draft.tags.filter((tag) => !filled.content.includes("#" + tag)).map((tag) => `\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u8BDD\u9898\u300C${tag}\u300D\u662F\u5426\u5DF2\u52A0\u5165\u3002`));
   let coverDialogContinued = false;
   for (const [index, ratio] of coverRatios.entries()) {
     const label = ratio === "3:4" ? "3:4 \u7AD6\u5C01\u9762" : "4:3 \u6A2A\u5C01\u9762";
@@ -8099,6 +8263,15 @@ async function waitForVideo(page, progress) {
       progress(0.2 + 0.35 * (percent ?? 0) / 100, percent === null ? "\u6B63\u5728\u4E0A\u4F20\u89C6\u9891\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3" : `\u6B63\u5728\u4E0A\u4F20\u89C6\u9891 ${percent}%\uFF0C\u8BF7\u4FDD\u7559\u6296\u97F3\u7A97\u53E3`);
     }
     await delay(1e3);
+  }
+}
+async function editorHoldsFilm(page, draft) {
+  if (draft.videoDuration == null) return false;
+  try {
+    const seconds = await page.evaluate(editorVideoDuration);
+    return seconds !== null && Math.abs(seconds * 1e3 - draft.videoDuration) <= 50;
+  } catch {
+    return false;
   }
 }
 async function canResume(page) {
@@ -8186,7 +8359,7 @@ function validateRequest(raw) {
   if (typeof r.data_dir !== "string" || !import_node_path4.default.isAbsolute(r.data_dir)) throw Error("data_dir \u9700\u8981\u7EDD\u5BF9\u8DEF\u5F84");
   if (typeof r.project_root !== "string" || r.project_root !== "" && !import_node_path4.default.isAbsolute(r.project_root)) throw Error("project_root \u9700\u8981\u7EDD\u5BF9\u8DEF\u5F84");
   const params = object(r.params ?? {}), settings = object(r.settings ?? {});
-  for (const key of Object.keys(params)) if (!["account"].includes(key)) throw Error(`\u4E0D\u652F\u6301\u53C2\u6570 ${key}\uFF1B\u63D2\u4EF6\u4E0D\u4F1A\u81EA\u52A8\u53D1\u5E03`);
+  for (const key of Object.keys(params)) if (!["account", "again"].includes(key)) throw Error(`\u4E0D\u652F\u6301\u53C2\u6570 ${key}\uFF1B\u63D2\u4EF6\u4E0D\u4F1A\u81EA\u52A8\u53D1\u5E03`);
   for (const value of Object.values(params)) if (typeof value !== "string" || value.length > 500) throw Error("\u53C2\u6570\u9700\u8981\u5B57\u7B26\u4E32");
   const browser = r.browser === void 0 ? void 0 : validateBridge(r.browser);
   return { project_root: r.project_root, data_dir: r.data_dir, params, settings, browser };
@@ -8256,7 +8429,7 @@ async function runOperation(operation, raw, progress = () => {
         const page = await deps.page(browser);
         let resume = false;
         if (draft && browser.reused) {
-          resume = store.lastUpload(account.id) === draft.videoHash && await canResume(page);
+          resume = await canResume(page) && (store.lastUpload(account.id) === draft.videoHash || await editorHoldsFilm(page, draft));
           if (!resume) await page.navigate(page.origin + UploadPath);
         }
         if (!draft) {
@@ -8284,6 +8457,7 @@ async function runOperation(operation, raw, progress = () => {
             if (masked && !paused) mask(message, fraction);
           }, {
             resume,
+            again: params.again === "1",
             onUpload: () => {
               store.recordUpload(account.id, draft.videoHash);
               mask("\u6B63\u5728\u4E0A\u4F20\u89C6\u9891", 0.2);
@@ -8298,6 +8472,9 @@ async function runOperation(operation, raw, progress = () => {
               if (masked) mask(lastMessage, lastFraction);
             }
           });
+        } catch (err) {
+          if (err instanceof AlreadyPublished) return { status: "already_published", message: err.message, account };
+          throw err;
         } finally {
           if (masked) await browser.idle?.().catch(() => {
           });
