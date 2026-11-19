@@ -434,3 +434,17 @@ it('读不到已发布作品时照常上传，并提醒用户留意', async () =
   await expect(preparePage(page, media(), () => {}, { timeout: 2000 })).resolves.toEqual([expect.stringContaining('没能读到这个账号已发布的作品')]);
   expect(await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')?.value)).toBe('我的标题');
 });
+
+
+it('标题或简介读回来对不上时只提醒，照样设好横竖两张封面', async () => {
+  const { page } = await pageFor('mismatch-covers');
+  // 网站把标题截短了：插件不该因此放弃后面的封面。
+  await page.evaluate(() => document.querySelector<HTMLInputElement>('input[placeholder]')!.addEventListener('input', event => {
+    const input = event.target as HTMLInputElement;
+    if (input.value.length > 2) input.value = input.value.slice(0, 2);
+  }));
+  const warnings = await preparePage(page, media(), () => {}, { timeout: 5000 });
+  expect(warnings).toEqual([expect.stringContaining('请在抖音页面检查标题')]);
+  expect(await page.evaluate(() => ({ covers: (window as any).covers, submits: (window as any).submits })))
+    .toEqual({ covers: { '3:4': 'portrait.png', '4:3': 'landscape.jpg' }, submits: 0 });
+});

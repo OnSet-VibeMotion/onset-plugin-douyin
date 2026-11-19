@@ -35,6 +35,16 @@ export function findPublished(works: scripts.PublishedWork[], draft: Draft): scr
     && (draft.videoDuration == null || Math.abs(work.duration - draft.videoDuration) <= 1500));
 }
 
+/**
+ * 页面上读回来的文字与发布信息是否一致。抖音的简介编辑器在每段末尾插零宽空格（U+200B），段落间的空行变成单个换行
+ * （2026-11-19 在真实页面上核对过），所以先去掉零宽字符、把空白合并成一个空格再比；简介后面还跟着话题，只要求包含。
+ */
+export function sameText(onPage: string, expected: string, prefix = false): boolean {
+  const normalize = (value: string) => value.replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+  const page = normalize(onPage), want = normalize(expected);
+  return prefix ? page.includes(want) : page === want;
+}
+
 /** 抖音草稿里的视频是不是这个成片：大小一样、修改时间（毫秒）一样。 */
 export function sameFilm(saved: { size: number; lastModified: number }, draft: Draft): boolean {
   return draft.videoSize !== undefined && draft.videoModified !== undefined
@@ -132,10 +142,9 @@ async function fillPage(page: Page, draft: Draft, progress: Progress, options: P
   }
   await page.checkpoint();
   const filled = await page.evaluate(scripts.filledContent);
-  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim();
-  if (filled.title !== draft.title || !normalize(filled.content).includes(normalize(draft.content))) {
-    throw Error('抖音页面上的标题或简介与发布信息不符，请在窗口检查');
-  }
+  // 对不上只提醒、不中断：封面照样要设，发布前用户本来就要在抖音页面核对一遍。
+  if (!sameText(filled.title, draft.title)) warnings.push('抖音页面上的标题与发布信息不一致，请在抖音页面检查标题。');
+  if (!sameText(filled.content, draft.content, true)) warnings.push('抖音页面上的简介与发布信息不一致，请在抖音页面检查简介。');
   warnings.push(...draft.tags.filter(tag => !filled.content.includes('#' + tag))
     .map(tag => `请在抖音页面检查话题「${tag}」是否已加入。`));
 

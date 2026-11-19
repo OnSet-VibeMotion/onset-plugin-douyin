@@ -8119,6 +8119,11 @@ function findPublished(works, draft) {
   const same = (a, b) => a.replace(/\s+/g, "") === b.replace(/\s+/g, "");
   return works.find((work) => same(work.title, draft.title) && (draft.videoDuration == null || Math.abs(work.duration - draft.videoDuration) <= 1500));
 }
+function sameText(onPage, expected, prefix = false) {
+  const normalize = (value) => value.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  const page = normalize(onPage), want = normalize(expected);
+  return prefix ? page.includes(want) : page === want;
+}
 function sameFilm(saved, draft) {
   return draft.videoSize !== void 0 && draft.videoModified !== void 0 && saved.size === draft.videoSize && Math.abs(saved.lastModified - draft.videoModified) <= 1;
 }
@@ -8212,10 +8217,8 @@ async function fillPage(page, draft, progress, options, timeout, guard) {
   }
   await page.checkpoint();
   const filled = await page.evaluate(filledContent);
-  const normalize = (value) => value.replace(/\s+/g, " ").trim();
-  if (filled.title !== draft.title || !normalize(filled.content).includes(normalize(draft.content))) {
-    throw Error("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u6807\u9898\u6216\u7B80\u4ECB\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u7B26\uFF0C\u8BF7\u5728\u7A97\u53E3\u68C0\u67E5");
-  }
+  if (!sameText(filled.title, draft.title)) warnings.push("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u6807\u9898\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u6807\u9898\u3002");
+  if (!sameText(filled.content, draft.content, true)) warnings.push("\u6296\u97F3\u9875\u9762\u4E0A\u7684\u7B80\u4ECB\u4E0E\u53D1\u5E03\u4FE1\u606F\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u7B80\u4ECB\u3002");
   warnings.push(...draft.tags.filter((tag) => !filled.content.includes("#" + tag)).map((tag) => `\u8BF7\u5728\u6296\u97F3\u9875\u9762\u68C0\u67E5\u8BDD\u9898\u300C${tag}\u300D\u662F\u5426\u5DF2\u52A0\u5165\u3002`));
   let coverDialogContinued = false;
   for (const [index, ratio] of coverRatios.entries()) {

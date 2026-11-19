@@ -5,7 +5,7 @@ import path from 'node:path';
 import { stringify } from 'yaml';
 import { AccountStore, newAccountID, withAccountLock } from '../src/accounts';
 import { mp4Duration, readDraft } from '../src/draft';
-import { findPublished, sameFilm } from '../src/prepare';
+import { findPublished, sameFilm, sameText } from '../src/prepare';
 import { projectFile, writeProjectJSON } from '../src/files';
 
 const roots: string[] = [];
@@ -179,5 +179,16 @@ describe('认出同一个成片', () => {
     expect(sameFilm({ size: 10, lastModified: 1795068327000 }, draft)).toBe(false);
     expect(sameFilm({ size: 11, lastModified: 1795068327347 }, draft)).toBe(false);
     expect(sameFilm({ size: 10, lastModified: 1795068327347 }, { ...draft, videoSize: undefined })).toBe(false);
+  });
+});
+
+describe('核对填进页面的文字', () => {
+  it('忽略抖音编辑器插的零宽空格与段落换行（照真实页面读回来的文字）', () => {
+    const expected = '它给出的答案是一个 U 形网络。\n\n这期视频先把 U-Net 原论文逐个模块拆开。';
+    const onPage = '它给出的答案是一个 U 形网络。​\n这期视频先把 U-Net 原论文逐个模块拆开。​ #papermark  ​ #深度学习  ​';
+    expect(sameText(onPage, expected, true)).toBe(true);
+    expect(sameText('PaperMark｜U-Net 十年：从细胞分割到大模型', 'PaperMark｜U-Net 十年：从细胞分割到大模型')).toBe(true);
+    expect(sameText('它给出的答案是一个 U 形网络。', expected, true)).toBe(false);
+    expect(sameText('PaperMark｜U-Net', 'PaperMark｜U-Net 十年')).toBe(false);
   });
 });
